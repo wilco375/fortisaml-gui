@@ -367,10 +367,38 @@ fn form_row(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui)) {
     ui.end_row();
 }
 
+/// Text field for a port. Unlike DragValue it never clamps: invalid text keeps the old port and says so.
+fn port_field(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, port: &mut u16) -> egui::Response {
+    ui.push_id(id, |ui| {
+        let key = ui.id().with("text");
+        let mut text = ui.data(|d| d.get_temp::<String>(key)).unwrap_or_else(|| port.to_string());
+        let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(60.0));
+        let parsed = text.trim().parse::<u16>().ok().filter(|&n| n != 0);
+        if let Some(n) = parsed {
+            *port = n;
+        }
+        // keep the text while typing or while it's invalid; otherwise show the stored port
+        let keep = r.has_focus() || parsed.is_none();
+        ui.data_mut(|d| {
+            if keep {
+                d.insert_temp(key, text);
+            } else {
+                d.remove::<String>(key);
+            }
+        });
+        if parsed.is_none() {
+            ui.label(RichText::new(format!("⚠ port must be 1 to 65535, still using {port}")).color(ui.visuals().warn_fg_color));
+        }
+        r
+    })
+    .inner
+}
+
 impl App {
     fn profile_editor(&mut self, ui: &mut egui::Ui) {
         let keyring_warning = self.keyring_warning.clone();
         let p = &mut self.cfg.profiles[self.cfg.selected];
+        let id = p.id.clone(); // per-profile edit state for the port fields
 
         section(ui, "Connection", true, |ui| {
             egui::Grid::new("general").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
@@ -398,8 +426,7 @@ impl App {
             if p.sso_enabled {
                 egui::Grid::new("sso").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                     form_row(ui, "Customize port", |ui| {
-                        ui.add(egui::DragValue::new(&mut p.saml_port).range(1..=65535))
-                            .on_hover_text("FortiGate 'auth-ike-saml-port'");
+                        port_field(ui, ("saml_port", &id), &mut p.saml_port).on_hover_text("FortiGate 'auth-ike-saml-port'");
                     });
                     form_row(ui, "", |ui| {
                         ui.checkbox(&mut p.open_browser, "Open the login page in the browser automatically");
@@ -446,7 +473,7 @@ impl App {
                 form_row(ui, "Encapsulation", |ui| {
                     ui.horizontal(|ui| {
                         ui.label("IKE UDP port");
-                        ui.add(egui::DragValue::new(&mut p.ike_port).range(1..=65535));
+                        port_field(ui, ("ike_port", &id), &mut p.ike_port);
                     });
                 });
             });

@@ -256,3 +256,53 @@ fn close_dialog_save_failure_keeps_dialog_open_with_error() {
     assert!(f.has(DIALOG));
     assert!(f.texts().any(|t| t.starts_with("error: the PSK couldn't be saved")));
 }
+
+// ---- port field ----
+
+/// Focus the port field, send `events`, then move focus away. Returns the port and the visible texts.
+fn edit_port(start: u16, events: Vec<egui::Event>) -> (u16, Vec<String>) {
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let mut port = start;
+    let mut texts = vec![];
+    let mut run = |port: &mut u16, events: Vec<egui::Event>, focus: bool| {
+        let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+            let r = port_field(ui, "p", port);
+            if focus {
+                r.request_focus();
+            } else {
+                r.surrender_focus();
+            }
+        });
+        if let Some(u) = out.platform_output.accesskit_update.take() {
+            texts = u.nodes.iter().filter_map(|(_, n)| n.label().or(n.value()).map(str::to_owned)).collect();
+        }
+        out.drop_without_applying_deltas();
+    };
+    run(&mut port, vec![], true);
+    run(&mut port, events, true);
+    run(&mut port, vec![], false);
+    run(&mut port, vec![], false);
+    (port, texts)
+}
+
+fn typed(s: &str) -> Vec<egui::Event> {
+    vec![egui::Event::Text(s.into())]
+}
+
+fn select_all() -> egui::Event {
+    egui::Event::Key { key: egui::Key::A, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND }
+}
+
+#[test]
+fn port_field_takes_a_typed_port() {
+    let (port, _) = edit_port(443, vec![select_all(), egui::Event::Text("8443".into())]);
+    assert_eq!(port, 8443);
+}
+
+#[test]
+fn port_field_rejects_too_big_instead_of_clamping() {
+    let (port, texts) = edit_port(443, typed("8443")); // appended: 4438443
+    assert_eq!(port, 443);
+    assert!(texts.iter().any(|t| t.contains("1 to 65535")), "{texts:?}");
+}
