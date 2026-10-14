@@ -112,7 +112,7 @@ fn duplicate_name_blocks_save() {
     app.cfg.profiles[1].psk = "k".into();
     app.save();
     let err = app.save_error.as_deref().unwrap();
-    assert!(err.starts_with("error: connection \"New connection\" can't be saved\n  note: its name is used by another connection"), "{err}");
+    assert!(err.starts_with("error: connection \"New connection\" can't be saved\n  note: Another connection already has this name."), "{err}");
     assert!(app.unsaved());
     assert_eq!(store.get(&app.cfg.profiles[1].id, Kind::Psk).unwrap(), None, "nothing saved");
 }

@@ -470,13 +470,21 @@ fn port_field(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, por
 impl App {
     fn profile_editor(&mut self, ui: &mut egui::Ui) {
         let keyring_warning = self.keyring_warning.clone();
+        let name_problem = self.cfg.name_problems()[self.cfg.selected];
         let p = &mut self.cfg.profiles[self.cfg.selected];
         let id = p.id.clone(); // per-profile edit state for the port fields
 
         section(ui, "Connection", true, |ui| {
             egui::Grid::new("general").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                 form_row(ui, "Connection name", |ui| {
-                    ui.text_edit_singleline(&mut p.name);
+                    ui.vertical(|ui| {
+                        let field = ui.text_edit_singleline(&mut p.name);
+                        // like the port fields: say why before Save refuses it; under the field, wrapped to its width
+                        if let Some(why) = name_problem {
+                            ui.set_max_width(field.rect.width());
+                            ui.add(egui::Label::new(RichText::new(format!("⚠ {why}")).color(ui.visuals().warn_fg_color)).wrap());
+                        }
+                    });
                 });
                 form_row(ui, "Description", |ui| {
                     ui.text_edit_singleline(&mut p.description);

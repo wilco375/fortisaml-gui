@@ -370,13 +370,13 @@ fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
 /// Why `name` can't be a profile file name, if it can't.
 fn name_problem(name: &str) -> Option<&'static str> {
     if name.trim().is_empty() {
-        Some("is empty")
+        Some("Name cannot be empty.")
     } else if name.contains(['/', '\0']) {
-        Some("contains a / or NUL character")
+        Some("Name cannot contain a '/'.")
     } else if name.starts_with('.') {
-        Some("starts with a dot")
+        Some("Name cannot start with a '.'.")
     } else if name.len() > 100 {
-        Some("is longer than 100 bytes")
+        Some("Name is too long.")
     } else {
         None
     }
@@ -385,16 +385,26 @@ fn name_problem(name: &str) -> Option<&'static str> {
 impl Config {
     /// One message per profile whose name can't be saved as a file; Save refuses while there are any.
     pub fn name_errors(&self) -> Vec<String> {
+        self.profiles
+            .iter()
+            .zip(self.name_problems())
+            .filter_map(|(p, why)| {
+                why.map(|why| {
+                    crate::diag("error", &format!("connection \"{}\" can't be saved", p.name), why, "choose another name and click Save")
+                })
+            })
+            .collect()
+    }
+
+    /// Per profile: why its name can't be saved as a file, if it can't. The editor shows it next to the name.
+    pub fn name_problems(&self) -> Vec<Option<&'static str>> {
         let mut seen = HashSet::new();
         self.profiles
             .iter()
-            .filter_map(|p| {
-                let why = name_problem(&p.name)
-                    .or_else(|| (!seen.insert(p.name.as_str())).then_some("is used by another connection"))
-                    .or_else(|| self.unreadable.contains_key(&p.name).then_some("belongs to a connection file that couldn't be read"));
-                why.map(|why| {
-                    crate::diag("error", &format!("connection \"{}\" can't be saved", p.name), &format!("its name {why}"), "choose another name and click Save")
-                })
+            .map(|p| {
+                name_problem(&p.name)
+                    .or_else(|| (!seen.insert(p.name.as_str())).then_some("Another connection already has this name."))
+                    .or_else(|| self.unreadable.contains_key(&p.name).then_some("A connection file with this name couldn't be read."))
             })
             .collect()
     }
@@ -873,9 +883,12 @@ mod tests {
         c.unreadable.insert("Broken".into(), new_uid());
         let errors = c.name_errors();
         assert_eq!(errors.len(), 7, "{errors:#?}");
-        assert_eq!(errors[2], "error: connection \"a/b\" can't be saved\n  note: its name contains a / or NUL character\n  help: choose another name and click Save");
-        assert!(errors[5].contains("its name is used by another connection"));
-        assert!(errors[6].contains("its name belongs to a connection file that couldn't be read"));
+        assert_eq!(errors[2], "error: connection \"a/b\" can't be saved\n  note: Name cannot contain a '/'.\n  help: choose another name and click Save");
+        assert!(errors[5].contains("Another connection already has this name."));
+        assert!(errors[6].contains("A connection file with this name couldn't be read."));
+        let problems = c.name_problems();
+        assert_eq!((problems[5], problems[6]), (None, Some("Another connection already has this name.")), "the first Office is fine, the second isn't");
+        assert_eq!((problems[2], problems[8]), (Some("Name cannot contain a '/'."), None));
     }
 
     #[test]
