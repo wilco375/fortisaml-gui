@@ -306,3 +306,30 @@ fn port_field_rejects_too_big_instead_of_clamping() {
     assert_eq!(port, 443);
     assert!(texts.iter().any(|t| t.contains("1 to 65535")), "{texts:?}");
 }
+
+// ---- whole window ----
+
+/// One frame of the full app; returns the texts and what was copied to the clipboard.
+fn app_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> (Vec<(egui::accesskit::NodeId, egui::accesskit::Node)>, Vec<String>) {
+    let mut ef = eframe::Frame::_new_kittest();
+    let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| eframe::App::ui(app, ui, &mut ef));
+    let nodes = out.platform_output.accesskit_update.take().map(|u| u.nodes).unwrap_or_default();
+    let copied = out.platform_output.commands.iter().filter_map(|c| match c {
+        egui::OutputCommand::CopyText(t) => Some(t.clone()),
+        _ => None,
+    }).collect();
+    out.drop_without_applying_deltas();
+    (nodes, copied)
+}
+
+#[test]
+fn ctrl_s_saves() {
+    let _t = TempConfig::new();
+    let mut app = app_with(&MemoryStore::default());
+    app.cfg.profiles[0].description = "dirty".into();
+    let ctx = egui::Context::default();
+    let ctrl_s = egui::Event::Key { key: egui::Key::S, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND };
+    app_frame(&ctx, &mut app, vec![ctrl_s]);
+    assert!(!app.unsaved());
+    assert!(file().contains("dirty"));
+}

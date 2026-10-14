@@ -578,6 +578,10 @@ impl eframe::App for App {
         if self.state == State::Connected || self.busy() {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
+        let save_key = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+        if ctx.input_mut(|i| i.consume_shortcut(&save_key)) && self.unsaved() {
+            self.save();
+        }
 
         egui::Panel::top("top").show(root, |ui| {
             ui.horizontal(|ui| {
