@@ -84,6 +84,8 @@ struct App {
     connect_started: Option<Instant>,
     /// when the login link was copied; shows "✔ Copied" for a moment
     copied_at: Option<Instant>,
+    /// SSO login finished in the browser: flash the taskbar entry once (Wayland won't let us raise the window)
+    want_attention: bool,
     show_settings: bool,
     confirm_delete: bool,
     stats: (u64, u64),
@@ -124,6 +126,7 @@ impl App {
             since: None,
             connect_started: None,
             copied_at: None,
+            want_attention: false,
             show_settings: false,
             confirm_delete: false,
             stats: (0, 0),
@@ -272,7 +275,10 @@ impl App {
         };
         match v.get("event").and_then(|e| e.as_str()).unwrap_or("") {
             "saml_url" => self.info.saml_url = s("url"),
-            "saml_ok" => self.info.username = s("username"),
+            "saml_ok" => {
+                self.info.username = s("username");
+                self.want_attention = true;
+            }
             "ike_start" => self.state = State::Negotiating,
             "established" => {
                 if let Some(c) = v.get("config") {
@@ -577,6 +583,9 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &root.ctx().clone();
         self.handle_events();
+        if std::mem::take(&mut self.want_attention) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
+        }
         self.read_stats();
         if self.state == State::Connected || self.busy() {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));

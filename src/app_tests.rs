@@ -388,3 +388,23 @@ fn password_prompt_is_explained_while_elevating() {
     app.state = State::Elevating;
     assert!(explained(&app_frame(&ctx, &mut app, vec![]).0));
 }
+
+#[test]
+fn finished_sso_login_asks_for_attention() {
+    let _t = TempConfig::new();
+    let mut app = app_with(&MemoryStore::default());
+    app.state = State::Authenticating;
+    let ctx = egui::Context::default();
+    let frame = |app: &mut App| {
+        let mut ef = eframe::Frame::_new_kittest();
+        let out = ctx.run_ui(Default::default(), |ui| eframe::App::ui(app, ui, &mut ef));
+        let cmds = out.viewport_output.get(&egui::ViewportId::ROOT).map(|o| o.commands.clone()).unwrap_or_default();
+        out.drop_without_applying_deltas();
+        cmds
+    };
+    let attention = egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational);
+    assert!(!frame(&mut app).contains(&attention));
+    app.tx.send(backend::Event::Status(serde_json::json!({"event": "saml_ok", "username": "u"}))).unwrap();
+    assert!(frame(&mut app).contains(&attention));
+    assert!(!frame(&mut app).contains(&attention), "only once");
+}
