@@ -637,7 +637,7 @@ impl eframe::App for App {
                         self.cfg.profiles.push(Profile::default());
                         self.cfg.selected = self.cfg.profiles.len() - 1;
                     }
-                    if ui.button("⧉ Copy").clicked() {
+                    if ui.button("🗐 Copy").clicked() {
                         let p = self.cfg.profiles[self.cfg.selected].duplicate();
                         self.cfg.profiles.push(p);
                         self.cfg.selected = self.cfg.profiles.len() - 1;
@@ -683,12 +683,14 @@ impl eframe::App for App {
             // status / connect bar
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let (dot, col) = match self.state {
-                    State::Connected => ("●", Color32::from_rgb(60, 170, 90)),
-                    State::Idle => ("●", Color32::GRAY),
-                    _ => ("●", Color32::from_rgb(220, 160, 40)),
+                let col = match self.state {
+                    State::Connected => Color32::from_rgb(60, 170, 90),
+                    State::Idle => Color32::GRAY,
+                    _ => Color32::from_rgb(220, 160, 40),
                 };
-                ui.label(RichText::new(dot).color(col).size(20.0));
+                // painted, not a "●" label: the proportional fonts have no glyph for it
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 6.0, col);
                 ui.label(RichText::new(self.state.label()).size(16.0));
                 if self.busy() && self.state != State::Connected {
                     ui.spinner();
