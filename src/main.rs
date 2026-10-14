@@ -574,17 +574,21 @@ impl eframe::App for App {
             ui.label(RichText::new("VPN connections").strong());
             ui.separator();
             let busy = self.busy();
-            for i in 0..self.cfg.profiles.len() {
-                let p = &self.cfg.profiles[i];
-                let mut text = RichText::new(&p.name);
-                if busy && i == self.profile_connected {
-                    text = text.color(if self.state == State::Connected { Color32::from_rgb(60, 170, 90) } else { Color32::from_rgb(220, 160, 40) });
+            // the list scrolls, so the buttons below stay reachable with many profiles
+            let buttons_h = 8.0 + ui.spacing().item_spacing.y + ui.spacing().interact_size.y;
+            egui::ScrollArea::vertical().max_height(ui.available_height() - buttons_h).show(ui, |ui| {
+                for i in 0..self.cfg.profiles.len() {
+                    let p = &self.cfg.profiles[i];
+                    let mut text = RichText::new(&p.name);
+                    if busy && i == self.profile_connected {
+                        text = text.color(if self.state == State::Connected { Color32::from_rgb(60, 170, 90) } else { Color32::from_rgb(220, 160, 40) });
+                    }
+                    if ui.add_enabled(!busy, egui::Button::selectable(i == self.cfg.selected, text)).clicked() {
+                        self.cfg.selected = i;
+                        self.confirm_delete = false;
+                    }
                 }
-                if ui.add_enabled(!busy, egui::Button::selectable(i == self.cfg.selected, text)).clicked() {
-                    self.cfg.selected = i;
-                    self.confirm_delete = false;
-                }
-            }
+            });
             ui.add_space(8.0);
             ui.add_enabled_ui(!busy, |ui| {
                 ui.horizontal(|ui| {
