@@ -322,6 +322,24 @@ fn app_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> (V
     (nodes, copied)
 }
 
+fn button<'a>(nodes: &'a [(egui::accesskit::NodeId, egui::accesskit::Node)], label: &str) -> Option<&'a egui::accesskit::Node> {
+    nodes.iter().map(|(_, n)| n).find(|n| n.role() == Role::Button && n.label() == Some(label))
+}
+
+#[test]
+fn save_button_says_what_state_you_are_in() {
+    let _t = TempConfig::new();
+    let mut app = app_with(&MemoryStore::default());
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    app_frame(&ctx, &mut app, vec![]);
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    assert!(button(&nodes, "✔ Saved").is_some());
+    app.cfg.profiles[0].description = "dirty".into();
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    assert!(button(&nodes, "💾 Save changes").is_some());
+}
+
 #[test]
 fn ctrl_s_saves() {
     let _t = TempConfig::new();

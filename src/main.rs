@@ -592,12 +592,15 @@ impl eframe::App for App {
                         self.show_settings = !self.show_settings;
                     }
                     ui.toggle_value(&mut self.cfg.show_log, "📜 Log");
-                    let unsaved = self.unsaved();
-                    if ui.add_enabled(unsaved, egui::Button::new("💾 Save")).clicked() {
-                        self.save();
-                    }
-                    if unsaved {
-                        ui.label(RichText::new("Unsaved changes").weak());
+                    let shortcut = ctx.format_shortcut(&save_key);
+                    if self.unsaved() {
+                        let b = egui::Button::new(RichText::new("💾 Save changes").strong().color(Color32::WHITE))
+                            .fill(ui.visuals().selection.bg_fill);
+                        if ui.add(b).on_hover_text(format!("Save the settings ({shortcut})")).clicked() {
+                            self.save();
+                        }
+                    } else {
+                        ui.add_enabled(false, egui::Button::new("✔ Saved")).on_disabled_hover_text("No unsaved changes");
                     }
                 });
             });
