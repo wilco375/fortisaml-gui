@@ -112,9 +112,9 @@ impl Session {
 
 /// (EAP identity, EAP secret) for a profile: SSO -> (UID, tokenid), EAP login -> (username, password).
 fn credentials(cfg: &Config, p: &Profile, sso_token: Option<String>) -> (Option<String>, String) {
-    match (p.sso_enabled, p.user_auth) {
+    match (p.sso.enabled, p.auth.mode) {
         (true, _) => (Some(cfg.uid.clone()), sso_token.unwrap_or_default()),
-        (false, UserAuth::Eap) => (Some(p.username.trim().to_string()), p.password.clone()),
+        (false, UserAuth::Eap) => (Some(p.auth.username.trim().to_string()), p.auth.password.clone()),
         (false, UserAuth::None) => (None, String::new()),
     }
 }
@@ -123,37 +123,37 @@ fn build_request(cfg: &Config, p: &Profile, sso_token: Option<String>) -> Backen
     let (eap_identity, token) = credentials(cfg, p, sso_token);
     let props = |v: &Vec<crate::config::Proposal>| v.iter().map(|x| x.spec()).collect::<Vec<_>>().join(",");
     // first group is used in the KE payload: prefer the strongest selected ECP group
-    let mut groups: Vec<u16> = [20, 21, 19, 14].into_iter().filter(|g| p.dh_groups.contains(g)).collect();
+    let mut groups: Vec<u16> = [20, 21, 19, 14].into_iter().filter(|g| p.ike.dh_groups.contains(g)).collect();
     if groups.is_empty() {
         groups.push(20);
     }
     BackendRequest {
         gateway: p.gateway.trim().to_string(),
-        ike_port: p.ike_port,
+        ike_port: p.ike.port,
         uid: cfg.uid.clone(),
         psk: p.psk.clone(),
         eap_identity,
         token,
-        local_id: Some(p.local_id.trim().to_string()).filter(|s| !s.is_empty()),
+        local_id: Some(p.ike.local_id.trim().to_string()).filter(|s| !s.is_empty()),
         dh_groups: groups,
-        ike_proposals: props(&p.ike_proposals),
-        esp_proposals: props(&p.esp_proposals),
-        natt_keepalive: p.natt_keepalive,
-        ifname: p.ifname.clone(),
-        mtu: p.mtu,
-        routes: match p.route_mode {
+        ike_proposals: props(&p.ike.proposals),
+        esp_proposals: props(&p.esp.proposals),
+        natt_keepalive: p.ike.natt_keepalive,
+        ifname: p.network.ifname.clone(),
+        mtu: p.network.mtu,
+        routes: match p.network.route_mode {
             RouteMode::Gateway => None,
             RouteMode::Full => Some(vec!["0.0.0.0/0".into()]),
             RouteMode::Custom => Some(
-                p.custom_routes
+                p.network.custom_routes
                     .split(|c: char| c == ',' || c.is_whitespace())
                     .filter(|r| !r.is_empty())
                     .map(String::from)
                     .collect(),
             ),
         },
-        block_ipv6: p.block_ipv6,
-        set_dns: p.set_dns,
+        block_ipv6: p.network.block_ipv6,
+        set_dns: p.network.set_dns,
         verbose: cfg.verbose,
     }
 }
@@ -162,17 +162,17 @@ fn run(cfg: &Config, p: &Profile, shared: &Arc<Mutex<Shared>>, cancel: &Arc<Atom
     if p.gateway.trim().is_empty() {
         return Err("no remote gateway configured".into());
     }
-    parse_proposals(&p.ike_proposals.iter().map(|x| x.spec()).collect::<Vec<_>>().join(","))?;
-    parse_proposals(&p.esp_proposals.iter().map(|x| x.spec()).collect::<Vec<_>>().join(","))?;
+    parse_proposals(&p.ike.proposals.iter().map(|x| x.spec()).collect::<Vec<_>>().join(","))?;
+    parse_proposals(&p.esp.proposals.iter().map(|x| x.spec()).collect::<Vec<_>>().join(","))?;
     if p.psk.is_empty() {
         return Err("no pre-shared key configured".into());
     }
-    if !p.sso_enabled && p.user_auth == UserAuth::Eap && (p.username.trim().is_empty() || p.password.is_empty()) {
+    if !p.sso.enabled && p.auth.mode == UserAuth::Eap && (p.auth.username.trim().is_empty() || p.auth.password.is_empty()) {
         return Err("enter a username and password (or enable SSO)".into());
     }
 
     // ---- 1. SAML, unprivileged, in-process (SSO profiles only) ----
-    let sso_token = if p.sso_enabled { Some(sso_login(cfg, p, cancel, send.clone())?) } else { None };
+    let sso_token = if p.sso.enabled { Some(sso_login(cfg, p, cancel, send.clone())?) } else { None };
     if cancel.load(Ordering::SeqCst) {
         return Ok(());
     }
@@ -190,11 +190,11 @@ fn sso_login(cfg: &Config, p: &Profile, cancel: &Arc<AtomicBool>, send: Arc<dyn 
     let res = crate::saml::login(
         &crate::saml::SamlParams {
             gateway: p.gateway.trim(),
-            port: p.saml_port,
+            port: p.sso.port,
             uid: &cfg.uid,
-            verify_cert: p.verify_cert,
-            open_browser: p.open_browser,
-            timeout: Duration::from_secs(p.saml_timeout as u64),
+            verify_cert: p.sso.verify_cert,
+            open_browser: p.sso.open_browser,
+            timeout: Duration::from_secs(p.sso.timeout as u64),
         },
         cancel,
         log,
@@ -434,6 +434,7 @@ pub fn probe_main(args: &[String]) -> i32 {
     let flag = |k: &str| args.iter().any(|a| a == k);
     VERBOSE.store(flag("-v"), Ordering::Relaxed);
     let cfg = Config::load();
+    cfg.load_errors.iter().for_each(|e| eprintln!("{e}"));
     let mut p = cfg.profiles[cfg.selected].clone();
     // read-only: probe never writes the config or the keyring
     match crate::keyring::SecretServiceStore::connect() {
@@ -444,49 +445,49 @@ pub fn probe_main(args: &[String]) -> i32 {
         p.gateway = g;
     }
     if let Some(x) = arg("--saml-port").and_then(|x| x.parse().ok()) {
-        p.saml_port = x;
+        p.sso.port = x;
     }
     if let Some(x) = arg("--ike-port").and_then(|x| x.parse().ok()) {
-        p.ike_port = x;
+        p.ike.port = x;
     }
     if let Some(k) = arg("--psk") {
         p.psk = k;
     }
     if flag("--no-sso") {
-        p.sso_enabled = false;
+        p.sso.enabled = false;
     }
     if flag("--no-eap") {
-        p.sso_enabled = false;
-        p.user_auth = UserAuth::None;
+        p.sso.enabled = false;
+        p.auth.mode = UserAuth::None;
     } else if arg("--username").is_some() {
-        p.user_auth = UserAuth::Eap;
+        p.auth.mode = UserAuth::Eap;
     }
     if let Some(u) = arg("--username") {
-        p.username = u;
+        p.auth.username = u;
     }
     if let Some(pw) = arg("--password") {
-        p.password = pw;
+        p.auth.password = pw;
     }
     if flag("--no-verify") {
-        p.verify_cert = false;
+        p.sso.verify_cert = false;
     }
     if flag("--no-browser") {
-        p.open_browser = false;
+        p.sso.open_browser = false;
     }
     let result = (|| -> Result<(), String> {
         let token = match arg("--token") {
             Some(t) => Some(t),
-            None if !p.sso_enabled => None,
+            None if !p.sso.enabled => None,
             None => Some({
                 let log: Arc<dyn Fn(String) + Send + Sync> = Arc::new(blog);
                 crate::saml::login(
                     &crate::saml::SamlParams {
                         gateway: p.gateway.trim(),
-                        port: p.saml_port,
+                        port: p.sso.port,
                         uid: &cfg.uid,
-                        verify_cert: p.verify_cert,
-                        open_browser: p.open_browser,
-                        timeout: Duration::from_secs(p.saml_timeout as u64),
+                        verify_cert: p.sso.verify_cert,
+                        open_browser: p.sso.open_browser,
+                        timeout: Duration::from_secs(p.sso.timeout as u64),
                     },
                     &AtomicBool::new(false),
                     log,
