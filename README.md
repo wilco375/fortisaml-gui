@@ -99,7 +99,7 @@ pkexec --backend; stdin: {settings, PSK, token}
 | File | Role |
 |---|---|
 | `src/main.rs` | egui UI; dispatches `--backend` / `--probe` / `--down` |
-| `src/config.rs` | profile model, defaults, atomic save |
+| `src/config.rs` | profile model, defaults, TOML settings files and state |
 | `src/keyring.rs` | PSK / password storage in the Secret Service |
 | `src/backend.rs` | connection session, pkexec bridge, privileged main loop, probe mode |
 | `src/saml.rs` | FortiGate SAML flow and local callback server |
@@ -110,8 +110,13 @@ pkexec --backend; stdin: {settings, PSK, token}
 
 ## Configuration and security
 
-- Settings are saved when you click **Save** to `~/.config/fortisaml-gui/config.json` (or under `$XDG_CONFIG_HOME`), mode `0600` in a `0700` directory. Closing with unsaved changes asks first.
-- The **PSK** and a **saved password** are not in that file. They're stored in your desktop keyring through the freedesktop Secret Service, as items labelled `FortiSAML VPN: <connection> (PSK)` / `(password)`. Without a Secret Service they're kept in memory until the app closes.
+- Settings are saved when you click **Save**, under `~/.config/fortisaml-gui/` (or `$XDG_CONFIG_HOME`), mode `0600` in a `0700` directory. Closing with unsaved changes asks first.
+  - `config.toml`: app settings (client UID, log file, verbose logging).
+  - `profiles/<connection name>.toml`: one file per connection. To share a connection, click **🔗 Share** and send the file. The recipient puts it in their `profiles/` folder, restarts the app and enters the PSK.
+  - Both only contain settings that differ from the defaults.
+- `~/.local/state/fortisaml-gui/state.json` (or `$XDG_STATE_HOME`) holds which connection is selected and the internal ids that link connections to their keyring items. The app manages it; don't edit it.
+- A connection file that can't be read is reported at startup and left untouched. A `config.toml` that can't be read is reported and replaced when you click **Save**. Older `config.json` files are not read.
+- The **PSK** and a **saved password** are not in these files. They're stored in your desktop keyring through the freedesktop Secret Service, as items labelled `FortiSAML VPN: <connection> (PSK)` / `(password)`. Without a Secret Service they're kept in memory until the app closes.
 - A password is stored only if *Save password* is ticked; otherwise it lives in memory until the app closes.
 - The SSO token is single-use and never written to disk.
 - **TLS on the SSO port:**

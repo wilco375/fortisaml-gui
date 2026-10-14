@@ -18,6 +18,7 @@ use backend::{Event, Session};
 use config::*;
 use eframe::egui::{self, Color32, RichText};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
 
@@ -25,6 +26,9 @@ use std::time::Instant;
 pub fn diag(level: &str, headline: &str, note: &str, help: &str) -> String {
     format!("{level}: {headline}\n  note: {note}\n  help: {help}")
 }
+
+const UID_HELP: &str = "Identifies this installation to the FortiGate, like the UID FortiClient generates at install. The app sends it with the SSO login and uses it as the EAP identity. The FortiGate may track devices by it, so only regenerate it if this setup was copied from another machine. Shared connection files don't include it.";
+const SHARE_HELP: &str = "Shows this connection's file in your file manager. Send the file to a colleague, who puts it in their profiles folder and restarts the app. The PSK and password aren't in the file.";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum State {
@@ -87,6 +91,11 @@ struct App {
     /// SSO login finished in the browser: flash the taskbar entry once (Wayland won't let us raise the window)
     want_attention: bool,
     show_settings: bool,
+    /// "Regenerate client UID?" dialog is open
+    confirm_regen: bool,
+    /// Open folder / Open log failed; shown in the settings window until the next success
+    settings_error: Option<String>,
+    share_error: Option<String>,
     confirm_delete: bool,
     stats: (u64, u64),
     stats_at: Option<Instant>,
@@ -103,14 +112,15 @@ impl App {
             Ok(s) => (Some(s), None),
             Err(u) => (None, Some(u.message())),
         };
-        let read_errors = keyring.as_deref().map(|s| keyring::fill(s, &mut cfg)).unwrap_or_default();
+        let mut startup_errors = std::mem::take(&mut cfg.load_errors);
+        startup_errors.extend(keyring.as_deref().map(|s| keyring::fill(s, &mut cfg)).unwrap_or_default());
         let saved = cfg.clone();
         cfg.dedupe_ids(); // after `saved`: a profile that got a new id is unsaved, Save stores its secrets under it
         let (tx, rx) = channel();
         let mut app = App {
             saved,
             cfg,
-            save_error: (!read_errors.is_empty()).then(|| read_errors.join("\n")),
+            save_error: None,
             keyring,
             keyring_warning,
             confirm_close: false,
@@ -128,6 +138,9 @@ impl App {
             copied_at: None,
             want_attention: false,
             show_settings: false,
+            confirm_regen: false,
+            settings_error: None,
+            share_error: None,
             confirm_delete: false,
             stats: (0, 0),
             stats_at: None,
@@ -135,6 +148,9 @@ impl App {
         if !config_path().exists() {
             app.save(); // writes the generated UID on first start
         }
+        // after the first-start save, which would clear them
+        startup_errors.extend(app.save_error.take());
+        app.save_error = (!startup_errors.is_empty()).then(|| startup_errors.join("\n"));
         app
     }
 
@@ -142,23 +158,30 @@ impl App {
         !self.cfg.settings_eq(&self.saved)
     }
 
-    /// Save button: write the config file, then bring the keyring in line with it.
+    /// Save button: write the settings files, then bring the keyring in line with them.
     fn save(&mut self) {
-        if let Err(e) = self.cfg.save() {
+        let name_errors = self.cfg.name_errors();
+        if !name_errors.is_empty() {
+            self.save_error = Some(name_errors.join("\n"));
+            return;
+        }
+        if let Err(e) = self.cfg.save(&self.saved) {
             self.save_error = Some(diag(
                 "error",
                 "the settings couldn't be saved",
-                &e.to_string(),
-                &format!("check that {} is writable and click Save to try again", config_path().display()),
+                &e,
+                &format!("check that {} is writable and click Save to try again", Paths::from_env().config_dir.display()),
             ));
             return;
         }
         self.save_error = None;
+        self.share_error = None; // the file it was about may have changed
         match self.keyring.as_deref() {
             Some(store) => {
                 let ops = keyring::plan(&self.saved, &self.cfg);
                 let (next, errors) = keyring::apply(store, &ops, &self.saved, &self.cfg);
                 self.saved = next;
+                self.cfg.orphans = self.saved.orphans.clone();
                 if !errors.is_empty() {
                     self.save_error = Some(errors.join("\n"));
                 }
@@ -207,10 +230,51 @@ impl App {
             });
     }
 
+    /// Regenerate button: ask first, the FortiGate will see a new device.
+    fn ask_regenerate_uid(&mut self) {
+        self.confirm_regen = true;
+    }
+
+    /// Answer to "Regenerate client UID?". The new UID is stored on Save, like any other change.
+    fn regenerate_uid(&mut self, confirmed: bool) {
+        if confirmed {
+            self.cfg.uid = new_uid();
+        }
+        self.confirm_regen = false;
+    }
+
+    /// Open folder / Open log buttons.
+    fn open_from_settings(&mut self, path: &Path, headline: &str) {
+        self.settings_error = opener::open(path).err().map(|e| diag("error", headline, &e.to_string(), &format!("open it yourself: {}", path.display())));
+    }
+
+    /// Browse… button: a save dialog starting at the current log file.
+    fn browse_log_file(&mut self) {
+        let current = self.cfg.log_file.trim();
+        let start = PathBuf::from(shellexpand::tilde(if current.is_empty() { "~/fortisaml.log" } else { current }).as_ref());
+        let mut dialog = rfd::FileDialog::new().set_title("Log file");
+        if let Some(dir) = start.parent().filter(|d| d.is_dir()) {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(name) = start.file_name() {
+            dialog = dialog.set_file_name(name.to_string_lossy());
+        }
+        if let Some(path) = dialog.save_file() {
+            self.cfg.log_file = path.display().to_string();
+        }
+    }
+
+    /// Share button: show the selected profile's file in the file manager.
+    fn share_profile(&mut self) {
+        let file = Paths::from_env().profile_file(&self.cfg.profiles[self.cfg.selected].name);
+        self.share_error = opener::reveal(&file).err().map(|e| diag("error", "the connection file couldn't be shown", &e.to_string(),
+            &format!("open it yourself: {}", file.display())));
+    }
+
     fn push_log(&mut self, line: String) {
         if !self.cfg.log_file.trim().is_empty() {
             use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(self.cfg.log_file.trim()) {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(shellexpand::tilde(self.cfg.log_file.trim()).as_ref()) {
                 let _ = writeln!(f, "{line}");
             }
         }
@@ -233,7 +297,7 @@ impl App {
         let p = self.cfg.profiles[self.cfg.selected].clone();
         self.push_log(format!("=== connecting \"{}\" ({}) ===", p.name, p.gateway));
         // without SSO there is no browser step: go straight to the root prompt
-        self.state = if p.sso_enabled { State::Authenticating } else { State::Elevating };
+        self.state = if p.sso.enabled { State::Authenticating } else { State::Elevating };
         self.session = Some(Session::start(&self.cfg, &p, self.tx.clone(), ctx.clone()));
     }
 
@@ -311,7 +375,7 @@ impl App {
             return;
         }
         if self.stats_at.map_or(true, |t| t.elapsed().as_millis() > 900) {
-            let ifn = &self.cfg.profiles[self.profile_connected].ifname;
+            let ifn = &self.cfg.profiles[self.profile_connected].network.ifname;
             let rd = |f: &str| {
                 std::fs::read_to_string(format!("/sys/class/net/{ifn}/statistics/{f}"))
                     .ok()
@@ -396,7 +460,7 @@ fn port_field(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, por
             }
         });
         if parsed.is_none() {
-            ui.label(RichText::new(format!("⚠ port must be 1 to 65535, still using {port}")).color(ui.visuals().warn_fg_color));
+            ui.label(RichText::new(format!("⚠ Port must be 1 to 65535. Still using {port}.")).color(ui.visuals().warn_fg_color));
         }
         r
     })
@@ -406,13 +470,21 @@ fn port_field(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, por
 impl App {
     fn profile_editor(&mut self, ui: &mut egui::Ui) {
         let keyring_warning = self.keyring_warning.clone();
+        let name_problem = self.cfg.name_problems()[self.cfg.selected];
         let p = &mut self.cfg.profiles[self.cfg.selected];
         let id = p.id.clone(); // per-profile edit state for the port fields
 
         section(ui, "Connection", true, |ui| {
             egui::Grid::new("general").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                 form_row(ui, "Connection name", |ui| {
-                    ui.text_edit_singleline(&mut p.name);
+                    ui.vertical(|ui| {
+                        let field = ui.text_edit_singleline(&mut p.name);
+                        // like the port fields: say why before Save refuses it; under the field, wrapped to its width
+                        if let Some(why) = name_problem {
+                            ui.set_max_width(field.rect.width());
+                            ui.add(egui::Label::new(RichText::new(format!("⚠ {why}")).color(ui.visuals().warn_fg_color)).wrap());
+                        }
+                    });
                 });
                 form_row(ui, "Description", |ui| {
                     ui.text_edit_singleline(&mut p.description);
@@ -430,40 +502,40 @@ impl App {
         });
 
         section(ui, "Authentication", true, |ui| {
-            ui.checkbox(&mut p.sso_enabled, "Enable Single Sign On (SSO) for VPN Tunnel");
+            ui.checkbox(&mut p.sso.enabled, "Enable Single Sign On (SSO) for VPN Tunnel");
             ui.add_space(4.0);
-            if p.sso_enabled {
+            if p.sso.enabled {
                 egui::Grid::new("sso").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                     form_row(ui, "Customize port", |ui| {
-                        port_field(ui, ("saml_port", &id), &mut p.saml_port).on_hover_text("FortiGate 'auth-ike-saml-port'");
+                        port_field(ui, ("saml_port", &id), &mut p.sso.port).on_hover_text("FortiGate 'auth-ike-saml-port'");
                     });
                     form_row(ui, "", |ui| {
-                        ui.checkbox(&mut p.open_browser, "Open the login page in the browser automatically");
+                        ui.checkbox(&mut p.sso.open_browser, "Open the login page in the browser automatically");
                     });
                     form_row(ui, "", |ui| {
-                        ui.checkbox(&mut p.verify_cert, "Verify the server certificate on the SSO port");
+                        ui.checkbox(&mut p.sso.verify_cert, "Verify the server certificate on the SSO port");
                     });
                     form_row(ui, "Login timeout (s)", |ui| {
-                        ui.add(egui::DragValue::new(&mut p.saml_timeout).range(30..=3600));
+                        ui.add(egui::DragValue::new(&mut p.sso.timeout).range(30..=3600));
                     });
                 });
             } else {
                 egui::Grid::new("userauth").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                     form_row(ui, "User authentication", |ui| {
                         ui.vertical(|ui| {
-                            ui.radio_value(&mut p.user_auth, UserAuth::Eap, "Username and password (EAP)");
-                            ui.radio_value(&mut p.user_auth, UserAuth::None, "None (pre-shared key only)");
+                            ui.radio_value(&mut p.auth.mode, UserAuth::Eap, "Username and password (EAP)");
+                            ui.radio_value(&mut p.auth.mode, UserAuth::None, "None (pre-shared key only)");
                         });
                     });
-                    if p.user_auth == UserAuth::Eap {
+                    if p.auth.mode == UserAuth::Eap {
                         form_row(ui, "Username", |ui| {
-                            ui.text_edit_singleline(&mut p.username);
+                            ui.text_edit_singleline(&mut p.auth.username);
                         });
                         form_row(ui, "Password", |ui| {
-                            ui.add(egui::TextEdit::singleline(&mut p.password).password(true));
+                            ui.add(egui::TextEdit::singleline(&mut p.auth.password).password(true));
                         });
                         form_row(ui, "", |ui| {
-                            ui.checkbox(&mut p.save_password, "Save password")
+                            ui.checkbox(&mut p.auth.save_password, "Save password")
                                 .on_hover_text("Unchecked: the password is only kept in memory until the app is closed");
                         });
                     }
@@ -482,14 +554,14 @@ impl App {
                 form_row(ui, "Encapsulation", |ui| {
                     ui.horizontal(|ui| {
                         ui.label("IKE UDP port");
-                        port_field(ui, ("ike_port", &id), &mut p.ike_port);
+                        port_field(ui, ("ike_port", &id), &mut p.ike.port);
                     });
                 });
             });
         });
 
         section(ui, "Phase 1", false, |ui| {
-            proposal_rows(ui, "p1", &mut p.ike_proposals);
+            proposal_rows(ui, "p1", &mut p.ike.proposals);
             ui.add_space(6.0);
             ui.label("DH group");
             ui.horizontal_wrapped(|ui| {
@@ -498,55 +570,55 @@ impl App {
                         .on_disabled_hover_text("not supported by this client");
                 }
                 for g in DH_SUPPORTED {
-                    let mut on = p.dh_groups.contains(&g);
+                    let mut on = p.ike.dh_groups.contains(&g);
                     if ui.checkbox(&mut on, g.to_string()).changed() {
                         if on {
-                            p.dh_groups.push(g);
-                            p.dh_groups.sort();
+                            p.ike.dh_groups.push(g);
+                            p.ike.dh_groups.sort();
                         } else {
-                            p.dh_groups.retain(|x| *x != g);
+                            p.ike.dh_groups.retain(|x| *x != g);
                         }
                     }
                 }
             });
             egui::Grid::new("p1b").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                 form_row(ui, "Local ID", |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut p.local_id).hint_text("Optional (default: local IP)"));
+                    ui.add(egui::TextEdit::singleline(&mut p.ike.local_id).hint_text("Optional (default: local IP)"));
                 });
                 form_row(ui, "NAT-T keepalive (s)", |ui| {
-                    ui.add(egui::DragValue::new(&mut p.natt_keepalive).range(5..=300));
+                    ui.add(egui::DragValue::new(&mut p.ike.natt_keepalive).range(5..=300));
                 });
             });
         });
 
         section(ui, "Phase 2", false, |ui| {
-            proposal_rows(ui, "p2", &mut p.esp_proposals);
+            proposal_rows(ui, "p2", &mut p.esp.proposals);
         });
 
         section(ui, "Network", false, |ui| {
             egui::Grid::new("net").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                 form_row(ui, "Routing", |ui| {
                     ui.vertical(|ui| {
-                        ui.radio_value(&mut p.route_mode, RouteMode::Gateway, "As pushed by the FortiGate");
-                        ui.radio_value(&mut p.route_mode, RouteMode::Full, "All traffic through the VPN");
-                        ui.radio_value(&mut p.route_mode, RouteMode::Custom, "Only these networks:");
-                        if p.route_mode == RouteMode::Custom {
-                            ui.add(egui::TextEdit::multiline(&mut p.custom_routes)
+                        ui.radio_value(&mut p.network.route_mode, RouteMode::Gateway, "As pushed by the FortiGate");
+                        ui.radio_value(&mut p.network.route_mode, RouteMode::Full, "All traffic through the VPN");
+                        ui.radio_value(&mut p.network.route_mode, RouteMode::Custom, "Only these networks:");
+                        if p.network.route_mode == RouteMode::Custom {
+                            ui.add(egui::TextEdit::multiline(&mut p.network.custom_routes)
                                 .hint_text("10.0.0.0/8\n192.168.10.0/24").desired_rows(3));
                         }
                     });
                 });
                 form_row(ui, "", |ui| {
-                    ui.checkbox(&mut p.set_dns, "Use DNS servers from the VPN (systemd-resolved)");
+                    ui.checkbox(&mut p.network.set_dns, "Use DNS servers from the VPN (systemd-resolved)");
                 });
                 form_row(ui, "", |ui| {
-                    ui.checkbox(&mut p.block_ipv6, "Block IPv6 while all traffic goes through the VPN");
+                    ui.checkbox(&mut p.network.block_ipv6, "Block IPv6 while all traffic goes through the VPN");
                 });
                 form_row(ui, "Interface name", |ui| {
-                    ui.text_edit_singleline(&mut p.ifname);
+                    ui.text_edit_singleline(&mut p.network.ifname);
                 });
                 form_row(ui, "MTU", |ui| {
-                    ui.add(egui::DragValue::new(&mut p.mtu).range(576..=1500));
+                    ui.add(egui::DragValue::new(&mut p.network.mtu).range(576..=1500));
                 });
             });
         });
@@ -554,28 +626,87 @@ impl App {
 
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
+        let hint = |ui: &mut egui::Ui, text: &str| {
+            ui.label(RichText::new(text).weak().small());
+        };
         egui::Window::new("Settings").open(&mut open).resizable(true).show(ctx, |ui| {
             egui::Grid::new("settings").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                form_row(ui, "Client UID", |ui| {
+                // form_row by hand: the label gets the explanation too
+                ui.label("Client UID").on_hover_text(UID_HELP);
+                ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut self.cfg.uid).desired_width(290.0).font(egui::TextStyle::Monospace))
-                            .on_hover_text("FortiClient installation UID: sent to the FortiGate during SSO and used as EAP identity");
+                            .on_hover_text(UID_HELP);
                         if ui.button("Regenerate").clicked() {
-                            self.cfg.uid = new_uid();
+                            self.ask_regenerate_uid();
+                        }
+                    });
+                    hint(ui, "Identifies this installation to the FortiGate.");
+                });
+                ui.end_row();
+                form_row(ui, "Log file", |ui| {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.cfg.log_file).hint_text("optional, e.g. ~/fortisaml.log"));
+                            if ui.button("Browse…").clicked() {
+                                self.browse_log_file();
+                            }
+                            let log = PathBuf::from(shellexpand::tilde(self.cfg.log_file.trim()).as_ref());
+                            if log.is_file() && ui.button("Open log").clicked() {
+                                self.open_from_settings(&log, "the log file couldn't be opened");
+                            }
+                        });
+                        hint(ui, "Optional. The app also appends the connection log to this file.");
+                    });
+                });
+                form_row(ui, "", |ui| {
+                    ui.vertical(|ui| {
+                        ui.checkbox(&mut self.cfg.verbose, "Verbose backend logging (keys are always redacted)");
+                        hint(ui, "Adds IKE protocol detail to the log, for troubleshooting.");
+                    });
+                });
+                form_row(ui, "Settings folder", |ui| {
+                    ui.horizontal(|ui| {
+                        let dir = Paths::from_env().config_dir;
+                        ui.add(egui::Label::new(RichText::new(dir.display().to_string()).monospace()).selectable(true));
+                        if ui.button("📂 Open folder").clicked() {
+                            match std::fs::create_dir_all(&dir) {
+                                Ok(()) => self.open_from_settings(&dir, "the settings folder couldn't be opened"),
+                                Err(e) => self.settings_error = Some(diag("error", "the settings folder couldn't be opened", &e.to_string(),
+                                    &format!("open it yourself: {}", dir.display()))),
+                            }
                         }
                     });
                 });
-                form_row(ui, "Log file", |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.cfg.log_file).hint_text("optional, e.g. ~/fortisaml.log"));
-                });
-                form_row(ui, "", |ui| {
-                    ui.checkbox(&mut self.cfg.verbose, "Verbose backend logging (keys are always redacted)");
+            });
+            if let Some(e) = &self.settings_error {
+                ui.label(RichText::new(e).monospace().color(ui.visuals().error_fg_color));
+            }
+        });
+        if !open {
+            self.settings_error = None;
+        }
+        self.show_settings = open;
+
+        if self.confirm_regen {
+            let modal = egui::Modal::new(egui::Id::new("regenerate_uid")).show(ctx, |ui| {
+                ui.heading("Regenerate client UID?");
+                ui.label("The FortiGate will see this installation as a new device. The new UID is used after you click Save.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Regenerate").clicked() {
+                        self.regenerate_uid(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.regenerate_uid(false);
+                    }
                 });
             });
-            ui.separator();
-            ui.label(RichText::new(format!("Settings file: {}", config_path().display())).weak());
-        });
-        self.show_settings = open;
+            // Escape or a click outside counts as Cancel
+            if self.confirm_regen && modal.should_close() {
+                self.regenerate_uid(false);
+            }
+        }
     }
 }
 
@@ -624,9 +755,44 @@ impl eframe::App for App {
             ui.label(RichText::new("VPN connections").strong());
             ui.separator();
             let busy = self.busy();
-            // the list scrolls, so the buttons below stay reachable with many profiles
-            let buttons_h = 8.0 + ui.spacing().item_spacing.y + ui.spacing().interact_size.y;
-            egui::ScrollArea::vertical().max_height(ui.available_height() - buttons_h).show(ui, |ui| {
+            // the buttons wrap in a narrow panel; the list above them scrolls, so they stay reachable with many profiles
+            egui::Panel::bottom("profile_buttons").frame(egui::Frame::NONE).show_separator_line(false).show(ui, |ui| {
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(!busy, egui::Button::new("➕ New")).clicked() {
+                        let mut p = Profile::default();
+                        p.name = self.cfg.unique_name(&p.name);
+                        self.cfg.profiles.push(p);
+                        self.cfg.selected = self.cfg.profiles.len() - 1;
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new("🗐 Copy")).clicked() {
+                        let mut p = self.cfg.profiles[self.cfg.selected].duplicate();
+                        p.name = self.cfg.unique_name(&p.name);
+                        self.cfg.profiles.push(p);
+                        self.cfg.selected = self.cfg.profiles.len() - 1;
+                    }
+                    // also while connected: it only shows the saved file
+                    let unsaved = self.unsaved();
+                    let share = ui.add_enabled(!unsaved, egui::Button::new("🔗 Share"))
+                        .on_disabled_hover_text("Save first, so the file matches what you see.")
+                        .on_hover_text(SHARE_HELP);
+                    if share.clicked() {
+                        self.share_profile();
+                    }
+                    if self.cfg.profiles.len() > 1 {
+                        if !self.confirm_delete {
+                            if ui.add_enabled(!busy, egui::Button::new("🗑 Delete")).clicked() {
+                                self.confirm_delete = true;
+                            }
+                        } else if ui.add_enabled(!busy, egui::Button::new(RichText::new("Confirm delete").color(Color32::RED))).clicked() {
+                            self.cfg.profiles.remove(self.cfg.selected);
+                            self.cfg.selected = self.cfg.selected.min(self.cfg.profiles.len() - 1);
+                            self.confirm_delete = false;
+                        }
+                    }
+                });
+            });
+            egui::ScrollArea::vertical().show(ui, |ui| {
                 for i in 0..self.cfg.profiles.len() {
                     let p = &self.cfg.profiles[i];
                     let mut text = RichText::new(&p.name);
@@ -638,31 +804,6 @@ impl eframe::App for App {
                         self.confirm_delete = false;
                     }
                 }
-            });
-            ui.add_space(8.0);
-            ui.add_enabled_ui(!busy, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("➕ New").clicked() {
-                        self.cfg.profiles.push(Profile::default());
-                        self.cfg.selected = self.cfg.profiles.len() - 1;
-                    }
-                    if ui.button("🗐 Copy").clicked() {
-                        let p = self.cfg.profiles[self.cfg.selected].duplicate();
-                        self.cfg.profiles.push(p);
-                        self.cfg.selected = self.cfg.profiles.len() - 1;
-                    }
-                    if self.cfg.profiles.len() > 1 {
-                        if !self.confirm_delete {
-                            if ui.button("🗑 Delete").clicked() {
-                                self.confirm_delete = true;
-                            }
-                        } else if ui.button(RichText::new("Confirm delete").color(Color32::RED)).clicked() {
-                            self.cfg.profiles.remove(self.cfg.selected);
-                            self.cfg.selected = self.cfg.selected.min(self.cfg.profiles.len() - 1);
-                            self.confirm_delete = false;
-                        }
-                    }
-                });
             });
         });
 
@@ -738,6 +879,9 @@ impl eframe::App for App {
             if let Some(e) = &self.save_error {
                 ui.label(RichText::new(e).monospace().color(ui.visuals().error_fg_color));
             }
+            if let Some(e) = &self.share_error {
+                ui.label(RichText::new(e).monospace().color(ui.visuals().error_fg_color));
+            }
             if self.state == State::Authenticating && !self.info.saml_url.is_empty() {
                 ui.add_space(4.0);
                 ui.label(RichText::new("Finish signing in in your browser.").strong());
@@ -764,7 +908,7 @@ impl eframe::App for App {
             } else if self.state == State::Authenticating && self.connect_started.is_some_and(|t| t.elapsed().as_secs() >= 5) {
                 let p = &self.cfg.profiles[self.profile_connected];
                 ui.label(
-                    RichText::new(format!("⏳ No answer from {}:{} yet. The SSO port may be wrong.", p.gateway.trim(), p.saml_port))
+                    RichText::new(format!("⏳ No answer from {}:{} yet. The SSO port may be wrong.", p.gateway.trim(), p.sso.port))
                         .color(ui.visuals().warn_fg_color),
                 );
             }

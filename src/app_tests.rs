@@ -1,5 +1,5 @@
 //! App tests without a window: Save, unsaved tracking, startup and the close dialog.
-//! They use an in-memory keyring and a temp config dir, one test at a time (config_path() reads XDG_CONFIG_HOME).
+//! They use an in-memory keyring and temp config/state dirs, one test at a time (Paths::from_env() reads XDG_*).
 
 use super::*;
 use crate::keyring::testing::MemoryStore;
@@ -24,7 +24,10 @@ impl TempConfig {
         let dir = std::env::temp_dir().join(format!("fortisaml-gui-test-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // SAFETY: tests touching the environment hold ENV
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+            std::env::set_var("XDG_STATE_HOME", dir.join("state"));
+        }
         Self { dir, _lock: lock }
     }
 }
@@ -39,15 +42,22 @@ fn app_with(store: &MemoryStore) -> App {
     App::with_keyring(Config::load(), Ok(Box::new(store.clone())))
 }
 
+/// config.toml plus every profile file.
 fn file() -> String {
-    std::fs::read_to_string(config_path()).unwrap_or_default()
+    let paths = Paths::from_env();
+    let mut s = std::fs::read_to_string(paths.config_file()).unwrap_or_default();
+    for e in std::fs::read_dir(paths.profiles_dir()).into_iter().flatten().flatten() {
+        s += &std::fs::read_to_string(e.path()).unwrap_or_default();
+    }
+    s
 }
 
 #[test]
 fn first_start_writes_config_and_is_clean() {
     let _t = TempConfig::new();
     let app = app_with(&MemoryStore::default());
-    assert!(config_path().exists());
+    let paths = Paths::from_env();
+    assert!(paths.config_file().exists() && paths.profile_file("New connection").exists() && paths.state_file().exists());
     assert!(!app.unsaved());
     assert!(app.save_error.is_none() && app.keyring_warning.is_none());
 }
@@ -78,25 +88,106 @@ fn restart_fills_secrets() {
 }
 
 #[test]
-fn view_state_and_unsaved_password_are_not_changes() {
+fn rename_moves_the_file_and_keeps_the_secrets() {
     let _t = TempConfig::new();
-    let mut app = app_with(&MemoryStore::default());
-    app.cfg.profiles.push(Profile::default());
+    let store = MemoryStore::default();
+    let mut app = app_with(&store);
+    app.cfg.profiles[0].psk = "k".into();
     app.save();
-    app.cfg.selected = 1;
-    app.cfg.show_log = !app.cfg.show_log;
-    app.cfg.profiles[0].password = "typed".into(); // "Save password" is off
+    app.cfg.profiles[0].name = "Home".into();
+    app.save();
+    let paths = Paths::from_env();
+    assert!(!paths.profile_file("New connection").exists() && paths.profile_file("Home").exists());
+    let app = app_with(&store);
+    assert_eq!((app.cfg.profiles[0].name.as_str(), app.cfg.profiles[0].psk.as_str()), ("Home", "k"));
     assert!(!app.unsaved());
 }
 
 #[test]
-fn duplicate_ids_in_file_are_fixed_and_saved_separately() {
+fn duplicate_name_blocks_save() {
+    let _t = TempConfig::new();
+    let store = MemoryStore::default();
+    let mut app = app_with(&store);
+    app.cfg.profiles.push(Profile::default()); // same name as the first
+    app.cfg.profiles[1].psk = "k".into();
+    app.save();
+    let err = app.save_error.as_deref().unwrap();
+    assert!(err.starts_with("error: connection \"New connection\" can't be saved\n  note: Another connection already has this name."), "{err}");
+    assert!(app.unsaved());
+    assert_eq!(store.get(&app.cfg.profiles[1].id, Kind::Psk).unwrap(), None, "nothing saved");
+}
+
+#[test]
+fn secrets_of_a_vanished_profile_file_are_deleted_on_save() {
+    let _t = TempConfig::new();
+    let store = MemoryStore::default();
+    let mut app = app_with(&store);
+    app.cfg.profiles.push(Profile { name: "Gone".into(), psk: "k".into(), ..Profile::default() });
+    app.save();
+    let gone = app.cfg.profiles[1].id.clone();
+    assert_eq!(store.get(&gone, Kind::Psk).unwrap().as_deref(), Some("k"));
+    std::fs::remove_file(Paths::from_env().profile_file("Gone")).unwrap();
+    let mut app = app_with(&store);
+    assert!(!app.unsaved(), "an orphan alone isn't an unsaved change");
+    app.cfg.profiles[0].description = "x".into();
+    app.save();
+    assert_eq!(store.get(&gone, Kind::Psk).unwrap(), None);
+    assert!(app.cfg.orphans.is_empty());
+}
+
+#[test]
+fn first_start_without_config_dir_keeps_secrets_named_in_state() {
     let _t = TempConfig::new();
     let store = MemoryStore::default();
     let id = "A".repeat(32);
     store.set(&id, Kind::Psk, "l", "k").unwrap();
-    std::fs::create_dir_all(config_path().parent().unwrap()).unwrap();
-    std::fs::write(config_path(), format!(r#"{{"profiles":[{{"id":"{id}"}},{{"id":"{id}"}}]}}"#)).unwrap();
+    let paths = Paths::from_env();
+    std::fs::create_dir_all(&paths.state_dir).unwrap();
+    std::fs::write(paths.state_file(), format!(r#"{{"ids":{{"Office":"{id}"}}}}"#)).unwrap();
+    let app = app_with(&store); // first start: also saves
+    assert!(app.save_error.is_none(), "{:?}", app.save_error);
+    assert_eq!(store.get(&id, Kind::Psk).unwrap().as_deref(), Some("k"));
+}
+
+#[test]
+fn bad_profile_file_is_reported_at_startup_and_left_alone() {
+    let _t = TempConfig::new();
+    let paths = Paths::from_env();
+    std::fs::create_dir_all(paths.profiles_dir()).unwrap();
+    std::fs::write(paths.profile_file("Broken"), "gateway = [").unwrap();
+    let mut app = app_with(&MemoryStore::default()); // first start: also saves
+    let err = app.save_error.clone().unwrap_or_default();
+    assert!(err.starts_with("error: ") && err.contains("Broken.toml couldn't be read"), "{err}");
+    app.cfg.profiles[0].description = "x".into();
+    app.save();
+    assert_eq!(std::fs::read_to_string(paths.profile_file("Broken")).unwrap(), "gateway = [");
+}
+
+#[test]
+fn view_state_and_unsaved_password_are_not_changes() {
+    let _t = TempConfig::new();
+    let mut app = app_with(&MemoryStore::default());
+    app.cfg.profiles.push(Profile { name: "Second".into(), ..Profile::default() });
+    app.save();
+    app.cfg.selected = 1;
+    app.cfg.show_log = !app.cfg.show_log;
+    app.cfg.profiles[0].auth.password = "typed".into(); // "Save password" is off
+    assert!(!app.unsaved());
+}
+
+#[test]
+fn duplicate_ids_in_state_are_fixed_and_saved_separately() {
+    let _t = TempConfig::new();
+    let store = MemoryStore::default();
+    let id = "A".repeat(32);
+    store.set(&id, Kind::Psk, "l", "k").unwrap();
+    let paths = Paths::from_env();
+    std::fs::create_dir_all(paths.profiles_dir()).unwrap();
+    std::fs::create_dir_all(&paths.state_dir).unwrap();
+    std::fs::write(paths.config_file(), "").unwrap(); // not a first start
+    std::fs::write(paths.profile_file("A"), "").unwrap();
+    std::fs::write(paths.profile_file("B"), "").unwrap();
+    std::fs::write(paths.state_file(), format!(r#"{{"ids":{{"A":"{id}","B":"{id}"}}}}"#)).unwrap();
     let mut app = app_with(&store);
     let new_id = app.cfg.profiles[1].id.clone();
     assert_ne!(new_id, id);
@@ -110,7 +201,9 @@ fn unwritable_config_shows_error_and_leaves_keyring_alone() {
     let _t = TempConfig::new();
     let store = MemoryStore::default();
     let mut app = app_with(&store);
-    std::fs::create_dir(config_path().with_extension("json.tmp")).unwrap(); // blocks the atomic write
+    let mut tmp = Paths::from_env().profile_file("New connection").into_os_string();
+    tmp.push(".tmp");
+    std::fs::create_dir(tmp).unwrap(); // blocks the atomic write
     app.cfg.profiles[0].psk = "k".into();
     app.save();
     assert!(app.save_error.as_deref().unwrap().starts_with("error: the settings couldn't be saved\n  note: "));
@@ -407,4 +500,38 @@ fn finished_sso_login_asks_for_attention() {
     app.tx.send(backend::Event::Status(serde_json::json!({"event": "saml_ok", "username": "u"}))).unwrap();
     assert!(frame(&mut app).contains(&attention));
     assert!(!frame(&mut app).contains(&attention), "only once");
+}
+
+// ---- settings window and sharing ----
+
+#[test]
+fn regenerate_uid_asks_first() {
+    let _t = TempConfig::new();
+    let mut app = app_with(&MemoryStore::default());
+    let uid = app.cfg.uid.clone();
+    app.ask_regenerate_uid();
+    assert!(app.confirm_regen);
+    assert_eq!(app.cfg.uid, uid);
+    app.regenerate_uid(false);
+    assert!(!app.confirm_regen);
+    assert_eq!(app.cfg.uid, uid);
+    assert!(!app.unsaved());
+    app.ask_regenerate_uid();
+    app.regenerate_uid(true);
+    assert!(!app.confirm_regen);
+    assert_ne!(app.cfg.uid, uid);
+    assert!(app.unsaved());
+}
+
+/// Fonts::has_glyphs can't be used: it reports every NotoEmoji char as missing, because that face also holds the
+/// replacement glyph. Look the chars up in the fonts' character maps instead.
+#[test]
+fn new_button_glyphs_exist_in_default_fonts() {
+    let ctx = egui::Context::default();
+    ctx.run_ui(Default::default(), |_| {}).drop_without_applying_deltas();
+    let has = |c: char| ctx.fonts_mut(|f| f.fonts.font(&egui::FontFamily::Proportional).characters().contains_key(&c));
+    assert!(!has('●') && !has('⧉'), "the check must catch the glyphs f21fbf3 replaced");
+    for label in ["📂 Open folder", "🔗 Share", "Browse…", "Open log", "Regenerate", "Cancel"] {
+        assert!(label.chars().all(has), "{label}");
+    }
 }
