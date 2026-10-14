@@ -748,6 +748,10 @@ impl eframe::App for App {
                         ctx.request_repaint_after(std::time::Duration::from_millis(500));
                     }
                 });
+            } else if self.state == State::Elevating {
+                ui.add_space(4.0);
+                ui.label(RichText::new("🔒 Enter your password in the system prompt.").strong());
+                ui.label("Setting up the VPN tunnel needs administrator rights.");
             } else if self.state == State::Authenticating && self.connect_started.is_some_and(|t| t.elapsed().as_secs() >= 5) {
                 let p = &self.cfg.profiles[self.profile_connected];
                 ui.label(

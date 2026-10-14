@@ -373,3 +373,18 @@ fn login_link_can_be_copied() {
     let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
     assert!(button(&nodes, "✔ Copied").is_some());
 }
+
+#[test]
+fn password_prompt_is_explained_while_elevating() {
+    let _t = TempConfig::new();
+    let mut app = app_with(&MemoryStore::default());
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let explained = |nodes: &[(egui::accesskit::NodeId, egui::accesskit::Node)]| {
+        nodes.iter().filter_map(|(_, n)| n.value()).any(|t| t.contains("needs administrator rights"))
+    };
+    app_frame(&ctx, &mut app, vec![]);
+    assert!(!explained(&app_frame(&ctx, &mut app, vec![]).0));
+    app.state = State::Elevating;
+    assert!(explained(&app_frame(&ctx, &mut app, vec![]).0));
+}
