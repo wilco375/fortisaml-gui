@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DONE_PAGE: &str = "<html><head><title>FortiSAML</title></head><body style=\"font-family:sans-serif\">\
-<h3>SSO login complete</h3><p>You can close this window and return to FortiSAML VPN.</p></body></html>";
+<h3>✔ Signed in</h3><p>You can close this tab. FortiSAML VPN continues setting up the connection.</p></body></html>";
 
 pub struct SamlResult {
     pub username: String,
