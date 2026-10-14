@@ -6,10 +6,13 @@ mod backend;
 mod config;
 mod crypto;
 mod ike;
+mod keyring;
 mod saml;
-mod secret;
 mod tls;
 mod tunnel;
+
+#[cfg(test)]
+mod app_tests;
 
 use backend::{Event, Session};
 use config::*;
@@ -17,6 +20,11 @@ use eframe::egui::{self, Color32, RichText};
 use serde_json::Value;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
+
+/// rustc-style message: "<level>: <headline>" plus a `note` (the cause) and a `help` (what now) line.
+pub fn diag(level: &str, headline: &str, note: &str, help: &str) -> String {
+    format!("{level}: {headline}\n  note: {note}\n  help: {help}")
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum State {
@@ -56,6 +64,13 @@ struct App {
     cfg: Config,
     saved: Config,
     save_error: Option<String>,
+    /// None: no Secret Service this session, secrets stay in memory (see `keyring_warning`)
+    keyring: Option<Box<dyn keyring::SecretStore>>,
+    keyring_warning: Option<String>,
+    /// "Unsaved changes" dialog is open
+    confirm_close: bool,
+    /// the user chose Save or Discard; let the next close request through
+    allow_close: bool,
     state: State,
     session: Option<Session>,
     profile_connected: usize,
@@ -73,12 +88,27 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let cfg = Config::load();
+        let keyring = keyring::SecretServiceStore::connect().map(|s| Box::new(s) as Box<dyn keyring::SecretStore>);
+        Self::with_keyring(Config::load(), keyring)
+    }
+
+    fn with_keyring(mut cfg: Config, keyring: Result<Box<dyn keyring::SecretStore>, keyring::Unavailable>) -> Self {
+        let (keyring, keyring_warning) = match keyring {
+            Ok(s) => (Some(s), None),
+            Err(u) => (None, Some(u.message())),
+        };
+        let read_errors = keyring.as_deref().map(|s| keyring::fill(s, &mut cfg)).unwrap_or_default();
+        let saved = cfg.clone();
+        cfg.dedupe_ids(); // after `saved`: a profile that got a new id is unsaved, Save stores its secrets under it
         let (tx, rx) = channel();
         let mut app = App {
-            saved: cfg.clone(),
+            saved,
             cfg,
-            save_error: None,
+            save_error: (!read_errors.is_empty()).then(|| read_errors.join("\n")),
+            keyring,
+            keyring_warning,
+            confirm_close: false,
+            allow_close: false,
             state: State::Idle,
             session: None,
             profile_connected: 0,
@@ -93,21 +123,79 @@ impl App {
             stats: (0, 0),
             stats_at: None,
         };
-        app.persist(); // writes the generated UID on first start
+        if !config_path().exists() {
+            app.save(); // writes the generated UID on first start
+        }
         app
     }
 
-    /// Save immediately whenever anything changed.
-    fn persist(&mut self) {
-        if self.cfg != self.saved || !config_path().exists() {
-            match self.cfg.save() {
-                Ok(()) => {
-                    self.saved = self.cfg.clone();
-                    self.save_error = None;
-                }
-                Err(e) => self.save_error = Some(format!("could not save settings: {e}")),
-            }
+    fn unsaved(&self) -> bool {
+        !self.cfg.settings_eq(&self.saved)
+    }
+
+    /// Save button: write the config file, then bring the keyring in line with it.
+    fn save(&mut self) {
+        if let Err(e) = self.cfg.save() {
+            self.save_error = Some(diag(
+                "error",
+                "the settings couldn't be saved",
+                &e.to_string(),
+                &format!("check that {} is writable and click Save to try again", config_path().display()),
+            ));
+            return;
         }
+        self.save_error = None;
+        match self.keyring.as_deref() {
+            Some(store) => {
+                let ops = keyring::plan(&self.saved, &self.cfg);
+                let (next, errors) = keyring::apply(store, &ops, &self.saved, &self.cfg);
+                self.saved = next;
+                if !errors.is_empty() {
+                    self.save_error = Some(errors.join("\n"));
+                }
+            }
+            None => self.saved = self.cfg.clone(),
+        }
+    }
+
+    /// Ask before closing with unsaved changes.
+    fn close_guard(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.unsaved() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_close = true;
+        }
+        if !self.confirm_close {
+            return;
+        }
+        egui::Window::new("Unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Save your changes before closing?");
+                if let Some(e) = &self.save_error {
+                    ui.label(RichText::new(e).monospace().color(ui.visuals().error_fg_color));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        self.save();
+                        // on failure the dialog stays open with the error; Discard still closes
+                        if !self.unsaved() {
+                            self.confirm_close = false;
+                            self.allow_close = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                    if ui.button("Discard").clicked() {
+                        self.confirm_close = false;
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_close = false;
+                    }
+                });
+            });
     }
 
     fn push_log(&mut self, line: String) {
@@ -277,6 +365,7 @@ fn form_row(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui)) {
 
 impl App {
     fn profile_editor(&mut self, ui: &mut egui::Ui) {
+        let keyring_warning = self.keyring_warning.clone();
         let p = &mut self.cfg.profiles[self.cfg.selected];
 
         section(ui, "Connection", true, |ui| {
@@ -294,6 +383,9 @@ impl App {
                     ui.add(egui::TextEdit::singleline(&mut p.psk).password(true));
                 });
             });
+            if let Some(w) = &keyring_warning {
+                ui.label(RichText::new(w).monospace().color(ui.visuals().warn_fg_color));
+            }
         });
 
         section(ui, "Authentication", true, |ui| {
@@ -465,6 +557,13 @@ impl eframe::App for App {
                         self.show_settings = !self.show_settings;
                     }
                     ui.toggle_value(&mut self.cfg.show_log, "📜 Log");
+                    let unsaved = self.unsaved();
+                    if ui.add_enabled(unsaved, egui::Button::new("💾 Save")).clicked() {
+                        self.save();
+                    }
+                    if unsaved {
+                        ui.label(RichText::new("Unsaved changes").weak());
+                    }
                 });
             });
         });
@@ -494,8 +593,7 @@ impl eframe::App for App {
                         self.cfg.selected = self.cfg.profiles.len() - 1;
                     }
                     if ui.button("⧉ Copy").clicked() {
-                        let mut p = self.cfg.profiles[self.cfg.selected].clone();
-                        p.name = format!("{} (copy)", p.name);
+                        let p = self.cfg.profiles[self.cfg.selected].duplicate();
                         self.cfg.profiles.push(p);
                         self.cfg.selected = self.cfg.profiles.len() - 1;
                     }
@@ -578,7 +676,7 @@ impl eframe::App for App {
                 ui.colored_label(Color32::LIGHT_RED, format!("⚠ {e}"));
             }
             if let Some(e) = &self.save_error {
-                ui.colored_label(Color32::LIGHT_RED, format!("⚠ {e}"));
+                ui.label(RichText::new(e).monospace().color(ui.visuals().error_fg_color));
             }
             if self.state == State::Authenticating && !self.info.saml_url.is_empty() {
                 ui.horizontal(|ui| {
@@ -642,11 +740,10 @@ impl eframe::App for App {
         });
 
         self.settings_window(ctx);
-        self.persist();
+        self.close_guard(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.persist();
         if let Some(s) = self.session.take() {
             s.shutdown(std::time::Duration::from_secs(8));
         }

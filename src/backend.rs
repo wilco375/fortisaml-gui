@@ -435,6 +435,11 @@ pub fn probe_main(args: &[String]) -> i32 {
     VERBOSE.store(flag("-v"), Ordering::Relaxed);
     let cfg = Config::load();
     let mut p = cfg.profiles[cfg.selected].clone();
+    // read-only: probe never writes the config or the keyring
+    match crate::keyring::SecretServiceStore::connect() {
+        Ok(store) => crate::keyring::fill_profile(&store, &mut p).iter().for_each(|e| eprintln!("{e}")),
+        Err(u) => eprintln!("{}", u.message()),
+    }
     if let Some(g) = arg("--gateway") {
         p.gateway = g;
     }
