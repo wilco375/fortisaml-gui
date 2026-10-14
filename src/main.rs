@@ -460,7 +460,7 @@ fn port_field(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, por
             }
         });
         if parsed.is_none() {
-            ui.label(RichText::new(format!("⚠ port must be 1 to 65535, still using {port}")).color(ui.visuals().warn_fg_color));
+            ui.label(RichText::new(format!("⚠ Port must be 1 to 65535. Still using {port}.")).color(ui.visuals().warn_fg_color));
         }
         r
     })
