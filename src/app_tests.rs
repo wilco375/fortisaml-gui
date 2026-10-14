@@ -326,6 +326,11 @@ fn button<'a>(nodes: &'a [(egui::accesskit::NodeId, egui::accesskit::Node)], lab
     nodes.iter().map(|(_, n)| n).find(|n| n.role() == Role::Button && n.label() == Some(label))
 }
 
+fn click_event(nodes: &[(egui::accesskit::NodeId, egui::accesskit::Node)], label: &str) -> egui::Event {
+    let (id, _) = nodes.iter().find(|(_, n)| n.role() == Role::Button && n.label() == Some(label)).expect(label);
+    egui::Event::AccessKitActionRequest(ActionRequest { action: Action::Click, target_tree: egui::accesskit::TreeId::ROOT, target_node: *id, data: None })
+}
+
 #[test]
 fn save_button_says_what_state_you_are_in() {
     let _t = TempConfig::new();
@@ -350,4 +355,21 @@ fn ctrl_s_saves() {
     app_frame(&ctx, &mut app, vec![ctrl_s]);
     assert!(!app.unsaved());
     assert!(file().contains("dirty"));
+}
+
+#[test]
+fn login_link_can_be_copied() {
+    let _t = TempConfig::new();
+    let mut app = app_with(&MemoryStore::default());
+    app.state = State::Authenticating;
+    app.info.saml_url = "https://idp.example/login".into();
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    app_frame(&ctx, &mut app, vec![]);
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    assert!(button(&nodes, "🌐 Open login page").is_some());
+    let (_, copied) = app_frame(&ctx, &mut app, vec![click_event(&nodes, "📋 Copy link")]);
+    assert_eq!(copied, ["https://idp.example/login"]);
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    assert!(button(&nodes, "✔ Copied").is_some());
 }

@@ -82,6 +82,8 @@ struct App {
     since: Option<Instant>,
     /// when Connect was clicked; drives the "no answer yet" notice
     connect_started: Option<Instant>,
+    /// when the login link was copied; shows "✔ Copied" for a moment
+    copied_at: Option<Instant>,
     show_settings: bool,
     confirm_delete: bool,
     stats: (u64, u64),
@@ -121,6 +123,7 @@ impl App {
             info: TunnelInfo::default(),
             since: None,
             connect_started: None,
+            copied_at: None,
             show_settings: false,
             confirm_delete: false,
             stats: (0, 0),
@@ -725,11 +728,22 @@ impl eframe::App for App {
                 ui.label(RichText::new(e).monospace().color(ui.visuals().error_fg_color));
             }
             if self.state == State::Authenticating && !self.info.saml_url.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new("Finish signing in in your browser.").strong());
                 ui.horizontal(|ui| {
-                    ui.label("Login page:");
-                    ui.hyperlink_to("open in browser", &self.info.saml_url);
-                    if ui.small_button("copy URL").clicked() {
+                    if ui.button("🌐 Open login page").on_hover_text(&self.info.saml_url).clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(&self.info.saml_url));
+                    }
+                    let copied = self.copied_at.is_some_and(|t| t.elapsed().as_secs() < 2);
+                    if ui.button(if copied { "✔ Copied" } else { "📋 Copy link" })
+                        .on_hover_text("Paste it into the browser where you're signed in")
+                        .clicked()
+                    {
                         ctx.copy_text(self.info.saml_url.clone());
+                        self.copied_at = Some(Instant::now());
+                    }
+                    if copied {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(500));
                     }
                 });
             } else if self.state == State::Authenticating && self.connect_started.is_some_and(|t| t.elapsed().as_secs() >= 5) {
