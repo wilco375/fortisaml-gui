@@ -80,6 +80,8 @@ struct App {
     error: Option<String>,
     info: TunnelInfo,
     since: Option<Instant>,
+    /// when Connect was clicked; drives the "no answer yet" notice
+    connect_started: Option<Instant>,
     show_settings: bool,
     confirm_delete: bool,
     stats: (u64, u64),
@@ -118,6 +120,7 @@ impl App {
             error: None,
             info: TunnelInfo::default(),
             since: None,
+            connect_started: None,
             show_settings: false,
             confirm_delete: false,
             stats: (0, 0),
@@ -219,6 +222,7 @@ impl App {
         self.error = None;
         self.info = TunnelInfo::default();
         self.since = None;
+        self.connect_started = Some(Instant::now());
         self.profile_connected = self.cfg.selected;
         let p = self.cfg.profiles[self.cfg.selected].clone();
         self.push_log(format!("=== connecting \"{}\" ({}) ===", p.name, p.gateway));
@@ -677,7 +681,11 @@ impl eframe::App for App {
                 });
             });
             if let Some(e) = &self.error {
-                ui.colored_label(Color32::LIGHT_RED, format!("⚠ {e}"));
+                if e.starts_with("error:") {
+                    ui.label(RichText::new(e).monospace().color(ui.visuals().error_fg_color));
+                } else {
+                    ui.colored_label(Color32::LIGHT_RED, format!("⚠ {e}"));
+                }
             }
             if let Some(e) = &self.save_error {
                 ui.label(RichText::new(e).monospace().color(ui.visuals().error_fg_color));
@@ -690,6 +698,12 @@ impl eframe::App for App {
                         ctx.copy_text(self.info.saml_url.clone());
                     }
                 });
+            } else if self.state == State::Authenticating && self.connect_started.is_some_and(|t| t.elapsed().as_secs() >= 5) {
+                let p = &self.cfg.profiles[self.profile_connected];
+                ui.label(
+                    RichText::new(format!("⏳ No answer from {}:{} yet. The SSO port may be wrong.", p.gateway.trim(), p.saml_port))
+                        .color(ui.visuals().warn_fg_color),
+                );
             }
             ui.separator();
 

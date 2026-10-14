@@ -9,7 +9,7 @@ use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{CertificateError, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -204,12 +204,29 @@ fn client_config(verify: bool, log: Log) -> Result<Arc<rustls::ClientConfig>, St
     Ok(Arc::new(builder.dangerous().with_custom_certificate_verifier(verifier).with_no_client_auth()))
 }
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// TCP connect that gives up after `CONNECT_TIMEOUT` instead of the OS default (minutes).
+fn connect(host: &str, port: u16) -> Result<TcpStream, String> {
+    let mut last = format!("can't resolve {host}");
+    for addr in (host, port).to_socket_addrs().map_err(|e| format!("can't resolve {host}: {e}"))? {
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(s) => return Ok(s),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                last = format!("connection timed out after {}s", CONNECT_TIMEOUT.as_secs())
+            }
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(last)
+}
+
 /// HTTPS POST; returns (status line + headers, body).
 pub fn https_post(host: &str, port: u16, path: &str, headers: &[(&str, &str)], body: &[u8], verify: bool, log: Log) -> Result<(String, Vec<u8>), String> {
     let cfg = client_config(verify, log)?;
     let name = ServerName::try_from(host.to_string()).map_err(|e| format!("bad server name {host}: {e}"))?;
     let mut conn = rustls::ClientConnection::new(cfg, name).map_err(|e| e.to_string())?;
-    let mut sock = TcpStream::connect((host, port)).map_err(|e| format!("connect {host}:{port}: {e}"))?;
+    let mut sock = connect(host, port)?;
     sock.set_read_timeout(Some(Duration::from_secs(15))).ok();
     let mut tls = rustls::Stream::new(&mut conn, &mut sock);
     let mut req = format!("POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());

@@ -55,6 +55,15 @@ pub struct SamlParams<'a> {
     pub timeout: Duration,
 }
 
+fn port_error(p: &SamlParams, cause: &str) -> String {
+    crate::diag(
+        "error",
+        &format!("no SSO login page at {}:{}", p.gateway, p.port),
+        cause,
+        "check the SSO port (FortiGate `auth-ike-saml-port`)",
+    )
+}
+
 /// `on_url` is called with the IdP start URL (for display / manual opening).
 pub fn login(
     p: &SamlParams,
@@ -68,21 +77,34 @@ pub fn login(
 
     log(format!("SAML: POST https://{}:{}/saml_login? (UID={}, REDIRECT_PORT={rport})", p.gateway, p.port, p.uid));
     let body = format!("UID={}&REDIRECT_PORT={rport}", p.uid);
-    let (head, html) = crate::tls::https_post(
-        p.gateway,
-        p.port,
-        "/saml_login?",
-        &[("Content-Type", "application/x-www-form-urlencoded"), ("User-Agent", "FortiClient Windows")],
-        body.as_bytes(),
-        p.verify_cert,
-        log.clone(),
-    )?;
+    // in the background, so Cancel works while the gateway is slow or silent; an abandoned request ends at
+    // its own connect/read timeout
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let (gateway, port, verify, log) = (p.gateway.to_string(), p.port, p.verify_cert, log.clone());
+        std::thread::spawn(move || {
+            let headers = [("Content-Type", "application/x-www-form-urlencoded"), ("User-Agent", "FortiClient Windows")];
+            let _ = tx.send(crate::tls::https_post(&gateway, port, "/saml_login?", &headers, body.as_bytes(), verify, log));
+        });
+    }
+    let (head, html) = loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("cancelled".into());
+        }
+        match rx.recv_timeout(Duration::from_millis(150)) {
+            Ok(r) => break r.map_err(|e| port_error(p, &e))?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(port_error(p, "the request ended without an answer")),
+        }
+    };
     let html = String::from_utf8_lossy(&html);
     let start = html
         .split_once("window.location=\"")
         .and_then(|(_, r)| r.split_once('"'))
         .map(|(u, _)| u.to_string())
-        .ok_or_else(|| format!("no window.location in /saml_login response ({}) - is the SSO port right?", head.lines().next().unwrap_or("")))?;
+        .ok_or_else(|| {
+            port_error(p, &format!("the answer isn't a FortiGate SSO page ({})", head.lines().next().unwrap_or("empty response")))
+        })?;
     let start = if start.starts_with('/') { format!("https://{}:{}{start}", p.gateway, p.port) } else { start };
     log(format!("SAML: identity provider login URL: {start}"));
     on_url(&start);
@@ -146,5 +168,55 @@ mod tests {
         assert_eq!(url_decode("user%40example.com"), "user@example.com");
         assert_eq!(query_param("tokenid=ab%2Fc&realm=&username=a%40b", "username").unwrap(), "a@b");
         assert_eq!(query_param("tokenid=ab%2Fc&realm=", "tokenid").unwrap(), "ab/c");
+    }
+
+    fn params(port: u16) -> SamlParams<'static> {
+        SamlParams { gateway: "127.0.0.1", port, uid: "X", verify_cert: false, open_browser: false, timeout: Duration::from_secs(5) }
+    }
+
+    fn quiet() -> Arc<dyn Fn(String) + Send + Sync> {
+        Arc::new(|_| {})
+    }
+
+    fn assert_port_error(e: &str, port: u16) {
+        assert!(e.starts_with(&format!("error: no SSO login page at 127.0.0.1:{port}\n  note: ")), "{e}");
+        assert!(e.contains("\n  help: check the SSO port (FortiGate `auth-ike-saml-port`)"), "{e}");
+    }
+
+    #[test]
+    fn refused_port_explains_itself() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port(); // closed again
+        let e = login(&params(port), &AtomicBool::new(false), quiet(), &|_| {}).err().unwrap();
+        assert_port_error(&e, port);
+    }
+
+    #[test]
+    fn non_tls_answer_explains_itself() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let _ = s.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+            }
+        });
+        let e = login(&params(port), &AtomicBool::new(false), quiet(), &|_| {}).err().unwrap();
+        assert_port_error(&e, port);
+    }
+
+    #[test]
+    fn cancel_returns_while_gateway_hangs() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap(); // connects, but never answers the TLS handshake
+        let port = l.local_addr().unwrap().port();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            c.store(true, Ordering::SeqCst);
+        });
+        let t0 = Instant::now();
+        let r = login(&params(port), &cancel, quiet(), &|_| {});
+        assert_eq!(r.err().as_deref(), Some("cancelled"));
+        assert!(t0.elapsed() < Duration::from_secs(2), "took {:?}", t0.elapsed());
+        drop(l);
     }
 }
