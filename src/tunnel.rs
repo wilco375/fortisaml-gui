@@ -1,234 +1,173 @@
-//! Kernel data plane: XFRM states/policies bound to an xfrm interface (if_id), UDP-encapsulated ESP on the
-//! IKE socket, routes (tagged with protocol RT_PROTO so they can always be found again) and DNS via
-//! systemd-resolved. Configuration is applied with iproute2 / resolvectl.
+//! Tunnel plumbing: our xfrm interface (bound to charon's SAs by `IF_ID`), and once charon has the SA up the virtual
+//! IP, routes, the IPv6 block and, in full tunnel, DNS routing. Every step records how to undo it.
 
-use crate::ike::{xfrm_auth, ChildSa, Ike};
-use std::os::fd::AsRawFd;
-use std::process::Command;
-
-pub const RT_PROTO: u32 = 233;
-pub const IF_ID: u32 = 0x5a17;
+use crate::charon::Established;
+use crate::net::{IfName, Ipv4Net, Mtu};
+use crate::{netlink, resolved};
 
 pub struct TunnelOpts {
-    pub ifname: String,
-    pub mtu: u16,
-    /// None = use what the gateway pushes; Some(list) = override (0.0.0.0/0 = full tunnel)
-    pub routes: Option<Vec<String>>,
+    pub ifname: IfName,
+    pub mtu: Mtu,
+    /// None = use the gateway's traffic selectors; Some = override (0.0.0.0/0 = full tunnel)
+    pub routes: Option<Vec<Ipv4Net>>,
     pub block_ipv6: bool,
     pub set_dns: bool,
 }
 
+#[derive(Debug, PartialEq)]
+enum Undo {
+    Link(u32),
+    Route(Ipv4Net),
+    Ipv6Block,
+}
+
 pub struct Tunnel {
-    cleanup: Vec<String>,
-    pub routes: Vec<String>,
+    undo: Vec<Undo>,
+    pub index: u32,
+    pub routes: Vec<Ipv4Net>,
     pub full: bool,
 }
 
-fn redact(cmd: &str) -> String {
-    // never log ESP keys
-    let mut out = Vec::new();
-    let mut hide = false;
-    for w in cmd.split(' ') {
-        if hide && w.starts_with("0x") {
-            out.push("0x<redacted>".to_string());
-            hide = false;
-            continue;
-        }
-        hide = w == "'cbc(aes)'" || w.starts_with("'hmac(");
-        out.push(w.to_string());
-    }
-    out.join(" ")
-}
-
-pub fn sh(cmd: &str, log: &dyn Fn(String)) -> Result<String, String> {
-    log(format!("+ {}", redact(cmd)));
-    let o = Command::new("sh").arg("-c").arg(cmd).output().map_err(|e| e.to_string())?;
-    if !o.status.success() {
-        return Err(format!("{}: {}", redact(cmd), String::from_utf8_lossy(&o.stderr).trim()));
-    }
-    Ok(String::from_utf8_lossy(&o.stdout).into())
-}
-
-fn quiet(cmd: &str) -> bool {
-    Command::new("sh").arg("-c").arg(cmd).output().map(|o| o.status.success()).unwrap_or(false)
-}
-
-fn which(bin: &str) -> bool {
-    quiet(&format!("command -v {bin} >/dev/null 2>&1"))
-}
-
-pub fn set_udp_encap(ike: &Ike, on: bool) -> Result<(), String> {
-    const UDP_ENCAP: libc::c_int = 100;
-    const UDP_ENCAP_ESPINUDP: libc::c_int = 2;
-    let v: libc::c_int = if on { UDP_ENCAP_ESPINUDP } else { 0 };
-    let r = unsafe {
-        libc::setsockopt(
-            ike.sock.as_raw_fd(),
-            libc::IPPROTO_UDP,
-            UDP_ENCAP,
-            &v as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if r != 0 {
-        return Err(format!("setsockopt(UDP_ENCAP): {}", std::io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-/// Remove leftovers of a previous run that died without cleanup. Returns number of items removed.
-pub fn purge_stale(ifname: &str) -> usize {
-    let mut n = 0;
-    for d in ["out", "in"] {
-        n += quiet(&format!("ip xfrm policy delete dir {d} src 0.0.0.0/0 dst 0.0.0.0/0 if_id {IF_ID}")) as usize;
-    }
-    if let Ok(o) = Command::new("ip").args(["xfrm", "state", "list"]).output() {
-        let text = String::from_utf8_lossy(&o.stdout).to_string();
-        let mut blocks: Vec<String> = vec![];
-        for line in text.lines() {
-            if line.starts_with("src ") {
-                blocks.push(String::new());
-            }
-            if let Some(b) = blocks.last_mut() {
-                b.push_str(line);
-                b.push('\n');
-            }
-        }
-        for b in blocks {
-            if !(b.contains(&format!("if_id {:#x}", IF_ID)) || b.contains(&format!("if_id {IF_ID}\n"))) {
-                continue;
-            }
-            let w: Vec<&str> = b.split_whitespace().collect();
-            let (src, dst) = (w.get(1), w.get(3));
-            let spi = w.iter().position(|x| *x == "spi").and_then(|i| w.get(i + 1));
-            if let (Some(s), Some(d), Some(spi)) = (src, dst, spi) {
-                n += quiet(&format!("ip xfrm state delete src {s} dst {d} proto esp spi {spi}")) as usize;
-            }
-        }
-    }
-    n += quiet(&format!("ip link del {ifname}")) as usize;
-    for fam in ["-4", "-6"] {
-        if let Ok(o) = Command::new("ip").args([fam, "route", "show", "proto", &RT_PROTO.to_string()]).output() {
-            for line in String::from_utf8_lossy(&o.stdout).lines().filter(|l| !l.trim().is_empty()) {
-                let r = line.split(" proto ").next().unwrap_or(line);
-                n += quiet(&format!("ip {fam} route del {r} proto {RT_PROTO}")) as usize;
-            }
-        }
-    }
-    n
-}
+const HALVES: [&str; 2] = ["0.0.0.0/1", "128.0.0.0/1"];
 
 impl Tunnel {
-    pub fn up(ike: &Ike, c: &ChildSa, o: &TunnelOpts, log: &dyn Fn(String)) -> Result<Tunnel, String> {
-        let mut t = Tunnel { cleanup: vec![], routes: vec![], full: false };
-        match t.install(ike, c, o, log) {
-            Ok(()) => Ok(t),
-            Err(e) => {
-                t.down(log);
-                Err(e)
-            }
-        }
+    /// Create the xfrm interface. Done before the IKE negotiation, so charon can hand the VPN's DNS servers to
+    /// resolvconf for this interface as soon as it gets them.
+    pub fn create(o: &TunnelOpts, log: &dyn Fn(String)) -> Result<Tunnel, String> {
+        log(format!("creating xfrm interface {} (if_id {:#x})", o.ifname, netlink::IF_ID));
+        let index = netlink::add_xfrm_link(&o.ifname)?;
+        Ok(Tunnel { undo: vec![Undo::Link(index)], index, routes: vec![], full: false })
     }
 
-    fn install(&mut self, ike: &Ike, c: &ChildSa, o: &TunnelOpts, log: &dyn Fn(String)) -> Result<(), String> {
-        let (l, g, lp) = (ike.local_ip, ike.gw, ike.local_port);
-        let (aalg, abits) = xfrm_auth(c.integ);
-        let hx = crate::ike::hex;
-        set_udp_encap(ike, true)?; // kernel now decapsulates ESP-in-UDP arriving on our IKE socket
-        for (src, dst, spi, enc, auth, sp, dp) in [
-            (l, g, &c.spi_out, &c.enc_i, &c.auth_i, lp, 4500),
-            (g, l, &c.spi_in, &c.enc_r, &c.auth_r, 4500, lp),
-        ] {
-            sh(
-                &format!(
-                    "ip xfrm state add src {src} dst {dst} proto esp spi 0x{} reqid 1 mode tunnel \
-                     enc 'cbc(aes)' 0x{} auth-trunc '{aalg}' 0x{} {abits} encap espinudp {sp} {dp} 0.0.0.0 if_id {IF_ID}",
-                    hx(spi),
-                    hx(enc),
-                    hx(auth)
-                ),
-                log,
-            )?;
-            self.cleanup.push(format!("ip xfrm state delete src {src} dst {dst} proto esp spi 0x{}", hx(spi)));
-        }
-        for (d, s, t) in [("out", l, g), ("in", g, l)] {
-            sh(&format!("ip xfrm policy add dir {d} src 0.0.0.0/0 dst 0.0.0.0/0 if_id {IF_ID} tmpl src {s} dst {t} proto esp reqid 1 mode tunnel"), log)?;
-            self.cleanup.push(format!("ip xfrm policy delete dir {d} src 0.0.0.0/0 dst 0.0.0.0/0 if_id {IF_ID}"));
-        }
-        let ifn = &o.ifname;
-        sh(&format!("ip link add {ifn} type xfrm if_id {IF_ID}"), log)?;
-        self.cleanup.push(format!("ip link del {ifn}"));
-        let vip = c.cfg.ip;
-        if let Some(v) = vip {
-            sh(&format!("ip addr add {v}/32 dev {ifn}"), log)?;
-        }
-        sh(&format!("ip link set {ifn} mtu {} up", o.mtu), log)?;
-
-        let mut routes: Vec<String> = match &o.routes {
-            Some(r) => r.clone(),
-            None => {
-                let mut r: Vec<String> = vec![];
-                for s in &c.cfg.subnets {
-                    if !r.contains(s) {
-                        r.push(s.clone());
-                    }
-                }
-                if r.is_empty() {
-                    for (a, b) in &c.tsr {
-                        r.extend(crate::ike::range_to_cidrs(*a, *b));
-                    }
-                }
-                r
-            }
-        };
-        self.full = routes.iter().any(|r| r == "0.0.0.0/0");
+    /// Bring the interface up with what the gateway assigned. On error the caller runs `down`.
+    pub fn configure(&mut self, est: &Established, o: &TunnelOpts, log: &dyn Fn(String)) -> Result<(), String> {
+        netlink::link_up(self.index, o.mtu.into())?;
+        netlink::add_addr(self.index, est.vip)?;
+        let mut routes = o.routes.clone().unwrap_or_else(|| est.remote_ts.clone());
+        self.full = routes.iter().any(|r| r.prefix() == 0);
         if self.full {
             // keep the gateway reachable outside the tunnel, then cover 0/0 with two /1 routes
-            let via = sh(&format!("ip -4 route get {g}"), log)?;
-            let first = via.lines().next().unwrap_or("").replace("cache", "");
-            let spec = first.split(" uid ").next().unwrap_or("").trim().to_string();
-            sh(&format!("ip route replace {spec} proto {RT_PROTO}"), log)?;
-            self.cleanup.insert(0, format!("ip route del {g}/32 proto {RT_PROTO}"));
-            routes = vec!["0.0.0.0/1".into(), "128.0.0.0/1".into()];
+            let (via, oif) = netlink::route_to(est.gateway)?;
+            let host = Ipv4Net::new(est.gateway, 32)?;
+            if netlink::add_route_via(host, via, oif)? {
+                self.undo.push(Undo::Route(host));
+            } else {
+                log(format!("using the existing route to the gateway {}", est.gateway));
+            }
+            routes = HALVES.iter().map(|h| h.parse().expect("valid network")).collect();
             if o.block_ipv6 {
-                for r6 in ["::/1", "8000::/1"] {
-                    let _ = sh(&format!("ip -6 route add unreachable {r6} metric 1 proto {RT_PROTO}"), log);
-                    self.cleanup.insert(0, format!("ip -6 route del unreachable {r6} metric 1 proto {RT_PROTO}"));
-                }
+                netlink::add_ipv6_block()?;
+                self.undo.push(Undo::Ipv6Block);
             }
         }
-        let src = vip.map(|v| format!(" src {v}")).unwrap_or_default();
         for r in &routes {
-            if let Err(e) = sh(&format!("ip route add {r} dev {ifn} proto {RT_PROTO}{src}"), log) {
-                log(format!("WARNING: {e}"));
+            log(format!("route {r} via {}", o.ifname));
+            match netlink::add_route(*r, self.index, Some(est.vip)) {
+                Ok(()) => self.undo.push(Undo::Route(*r)),
+                Err(e) => log(format!("WARNING: route {r}: {e}")),
             }
         }
         self.routes = routes;
-        if o.set_dns && !c.cfg.dns.is_empty() {
-            if which("resolvectl") {
-                let dns: Vec<String> = c.cfg.dns.iter().map(|d| d.to_string()).collect();
-                let _ = sh(&format!("resolvectl dns {ifn} {}", dns.join(" ")), log);
-                let mut domains: Vec<String> = c.cfg.domain.iter().cloned().collect();
-                if self.full {
-                    domains.push("~.".into()); // all DNS through the VPN
-                    let _ = sh(&format!("resolvectl default-route {ifn} yes"), log);
-                }
-                if !domains.is_empty() {
-                    let _ = sh(&format!("resolvectl domain {ifn} {}", domains.join(" ")), log);
-                }
-            } else {
-                log("WARNING: resolvectl not found; VPN DNS servers not configured".into());
+        if o.set_dns && self.full {
+            // a DNS failure leaves a working tunnel: warn, don't fail
+            if let Err(e) = resolved::route_all_queries(self.index) {
+                log(format!("WARNING: DNS queries not routed through the VPN: {e}"));
             }
         }
         Ok(())
     }
 
-    /// Undo everything (each step independent; resolved drops per-link DNS with the interface).
+    /// Undo everything, newest first; each step independent.
     pub fn down(&mut self, log: &dyn Fn(String)) {
-        for cmd in self.cleanup.drain(..).rev() {
-            if let Err(e) = sh(&cmd, log) {
-                log(format!("cleanup: {e}"));
+        while let Some(u) = self.undo.pop() {
+            let r = match &u {
+                Undo::Link(i) => netlink::del_link(*i),
+                Undo::Route(n) => netlink::del_route(*n),
+                Undo::Ipv6Block => netlink::del_ipv6_block(),
+            };
+            if let Err(e) = r {
+                log(format!("cleanup {u:?}: {e}"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Real kernel tests in a throwaway network namespace: run with `scripts/netns-test.sh`.
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn est(remote_ts: &[&str]) -> Established {
+        Established {
+            gateway: Ipv4Addr::new(198, 51, 100, 7),
+            vip: Ipv4Addr::new(10, 98, 0, 2),
+            remote_ts: remote_ts.iter().map(|t| t.parse().unwrap()).collect(),
+        }
+    }
+
+    fn opts(routes: Option<Vec<Ipv4Net>>) -> TunnelOpts {
+        TunnelOpts { ifname: "fsamltest0".parse().unwrap(), mtu: Mtu::try_from(1400).unwrap(), routes, block_ipv6: true, set_dns: false }
+    }
+
+    fn quiet(_: String) {}
+
+    #[test]
+    #[ignore]
+    fn split_tunnel_up_and_down() {
+        let mut t = Tunnel::create(&opts(None), &quiet).unwrap();
+        t.configure(&est(&["10.10.0.0/16", "10.20.0.0/16"]), &opts(None), &quiet).unwrap();
+        assert!(!t.full);
+        assert_eq!(t.routes.len(), 2);
+        assert!(netlink::link_index(&"fsamltest0".parse().unwrap()).unwrap().is_some());
+        t.down(&quiet);
+        assert!(netlink::link_index(&"fsamltest0".parse().unwrap()).unwrap().is_none());
+        assert_eq!(netlink::purge(&"fsamltest0".parse().unwrap()).unwrap(), 0, "nothing left behind");
+    }
+
+    #[test]
+    #[ignore]
+    fn full_tunnel_keeps_gateway_route_and_blocks_ipv6() {
+        // uplink with a default route, as on a real machine
+        let up: IfName = "fsamlup0".parse().unwrap();
+        netlink::add_dummy_for_tests(&up, Ipv4Addr::new(192, 0, 2, 10), 24).unwrap();
+        let ui = netlink::link_index(&up).unwrap().unwrap();
+        netlink::add_route_via("0.0.0.0/0".parse().unwrap(), Some(Ipv4Addr::new(192, 0, 2, 1)), ui).unwrap();
+
+        let mut t = Tunnel::create(&opts(None), &quiet).unwrap();
+        t.configure(&est(&["0.0.0.0/0"]), &opts(None), &quiet).unwrap();
+        assert!(t.full);
+        assert_eq!(t.routes, HALVES.map(|h| h.parse::<Ipv4Net>().unwrap()));
+        assert_eq!(netlink::route_to(Ipv4Addr::new(198, 51, 100, 7)).unwrap(), (Some(Ipv4Addr::new(192, 0, 2, 1)), ui), "gateway stays outside");
+        assert_eq!(netlink::route_to(Ipv4Addr::new(203, 0, 113, 9)).unwrap().1, t.index, "everything else goes in");
+        t.down(&quiet);
+        assert_eq!(netlink::route_to(Ipv4Addr::new(203, 0, 113, 9)).unwrap().1, ui, "back to normal");
+    }
+
+    #[test]
+    #[ignore]
+    fn existing_route_to_the_gateway_is_used_and_left_alone() {
+        // e.g. left behind by another VPN client: full tunnel must still work, and not delete it afterwards
+        let up: IfName = "fsamlup0".parse().unwrap();
+        netlink::add_dummy_for_tests(&up, Ipv4Addr::new(192, 0, 2, 10), 24).unwrap();
+        let ui = netlink::link_index(&up).unwrap().unwrap();
+        netlink::add_route_via("0.0.0.0/0".parse().unwrap(), Some(Ipv4Addr::new(192, 0, 2, 1)), ui).unwrap();
+        netlink::add_foreign_route_for_tests("198.51.100.7/32".parse().unwrap(), Ipv4Addr::new(192, 0, 2, 1), ui).unwrap();
+
+        let mut t = Tunnel::create(&opts(None), &quiet).unwrap();
+        t.configure(&est(&["0.0.0.0/0"]), &opts(None), &quiet).unwrap();
+        t.down(&quiet);
+        assert_eq!(netlink::route_to(Ipv4Addr::new(198, 51, 100, 7)).unwrap(), (Some(Ipv4Addr::new(192, 0, 2, 1)), ui), "still there");
+    }
+
+    #[test]
+    #[ignore]
+    fn failure_midway_undoes_earlier_steps() {
+        // full tunnel without any route to the gateway: route_to fails after the interface exists
+        let mut t = Tunnel::create(&opts(None), &quiet).unwrap();
+        let e = t.configure(&est(&["0.0.0.0/0"]), &opts(None), &quiet).unwrap_err();
+        assert!(e.contains("198.51.100.7") || e.contains("unreachable"), "{e}");
+        t.down(&quiet);
+        assert!(netlink::link_index(&"fsamltest0".parse().unwrap()).unwrap().is_none(), "interface removed again");
     }
 }

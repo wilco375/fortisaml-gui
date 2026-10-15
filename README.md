@@ -8,13 +8,12 @@ A native Linux client for **FortiGate dial-up IPsec (IKEv2) VPNs with SAML singl
 
 - **SAML SSO:** login in your normal browser, with a local callback.
 - **Username/password (EAP)** and **pre-shared-key-only** modes when SSO is off.
-- **IKEv2** with the Fortinet vendor IDs, configurable phase 1 and phase 2 proposals (AES-128/192/256-CBC, SHA1/256/384/512) and DH groups 14, 19, 20 and 21.
-- **EAP methods:** MSCHAPv2, GTC and MD5 (the FortiGate picks one).
-- **Gateway authentication** with the PSK is verified, so a gateway that doesn't know it is rejected.
-- **Kernel IPsec:** XFRM with UDP-encapsulated ESP on an `fsaml0` xfrm interface. The kernel carries all traffic.
+- **IKEv2 by strongSwan:** a private `charon` instance negotiates, rekeys and runs dead-peer detection, with configurable phase 1 and phase 2 proposals (AES-128/192/256-CBC, SHA1/256/384/512) and DH groups 14, 19, 20 and 21.
+- **EAP methods:** MSCHAPv2, GTC and MD5 (the FortiGate picks one). The gateway is authenticated with the PSK.
+- **Kernel IPsec:** XFRM with UDP-encapsulated ESP, bound to an `fsaml0` xfrm interface. The kernel carries all traffic.
 - **Routing:** split tunnel as pushed by the gateway, full tunnel, or a custom network list. In full-tunnel mode IPv6 is blocked so it can't leak around the VPN.
-- **DNS** from the VPN via systemd-resolved.
-- **Root only while connected:** a `pkexec` prompt appears on Connect, and the GUI itself never runs as root.
+- **DNS** from the VPN, handed to the system through `resolvconf` (systemd-resolved, openresolv or Debian resolvconf). In full-tunnel mode all queries go to the VPN when systemd-resolved is used.
+- **Root only while setting up:** a `pkexec` prompt appears on Connect. After the tunnel is up, the backend switches to your user and keeps only the network-admin and kill capabilities. The GUI itself never runs as root.
 - **Multiple connection profiles**, saved with the Save button. The PSK and password are stored in your desktop keyring.
 
 ## Requirements
@@ -22,7 +21,8 @@ A native Linux client for **FortiGate dial-up IPsec (IKEv2) VPNs with SAML singl
 | | |
 |---|---|
 | OS | Linux with XFRM interface support (kernel ≥ 4.19) |
-| Runtime tools | `pkexec` (polkit) with a desktop polkit agent, `ip` (iproute2), `xdg-open`; `resolvectl` (systemd-resolved) for VPN DNS |
+| strongSwan | `charon-systemd` with the EAP plugins: Fedora `strongswan`, Debian/Ubuntu `charon-systemd strongswan-swanctl libstrongswan-standard-plugins libcharon-extra-plugins libcharon-extauth-plugins`, Arch `strongswan`. The app runs its own private instance; the system `strongswan` service doesn't need to run. libreswan can't be used: it has no EAP-MSCHAPv2. |
+| Runtime tools | `pkexec` (polkit) with a desktop polkit agent, `xdg-open`; a `resolvconf` implementation for VPN DNS |
 | Keyring (optional) | a Secret Service provider (GNOME Keyring, KWallet, KeePassXC) to remember the PSK and password; without one they're kept in memory until the app closes |
 | Build | Rust ≥ 1.85 (edition 2024), `cargo` |
 | Display | X11 or Wayland; OpenGL rendering via glow |
@@ -48,7 +48,7 @@ The binary is self-contained. When you connect, it starts a second copy of itsel
 4. Click **Connect**:
    1. With SSO, your browser opens; log in there.
    2. The system asks for your password (pkexec), because setting up the tunnel needs root.
-   3. The status changes to **Connected**, showing the VPN IP, routes, DNS, duration and traffic counters.
+   3. The status changes to **Connected**, showing the VPN IP, routes, duration and traffic counters.
 5. Click **Disconnect** to tear everything down. Closing the window also disconnects.
 
 **Settings (⚙):**
@@ -61,8 +61,8 @@ The binary is self-contained. When you connect, it starts a second copy of itsel
 | Command | Purpose |
 |---|---|
 | `fortisaml-gui` | Start the GUI |
-| `fortisaml-gui --probe [options]` | **Unprivileged test:** SSO + full IKEv2/EAP negotiation with the selected profile, then delete the SA. Nothing is installed in the kernel. |
-| `sudo fortisaml-gui --down [ifname]` | Remove leftovers of a crashed session (XFRM states/policies, interface, routes) |
+| `fortisaml-gui --probe [options]` | **Test:** SSO + IKEv2/EAP negotiation with the selected profile through strongSwan (asks for root via pkexec), then delete the SA. No interface, routes or DNS are set up. |
+| `sudo fortisaml-gui --down [ifname]` | Remove leftovers of a crashed session (interface, routes, a stray private charon) |
 | `fortisaml-gui --backend` | Internal: the privileged backend started by pkexec |
 
 `--probe` options:
@@ -75,24 +75,29 @@ Environment: `FORTISAML_BROWSER=<command>` replaces `xdg-open` for opening the S
 
 ## How it works
 
-```
-GUI (your user)                         Backend (root, via pkexec)              FortiGate
-───────────────                         ──────────────────────────              ─────────
-POST /saml_login?  UID=…&REDIRECT_PORT=p ─────────────────────────────────────▶ (HTTPS, SSO port)
-browser → IdP login → 127.0.0.1:p/?tokenid=…  ◀──────────────────────────────── redirect
-pkexec --backend; stdin: {settings, PSK, token}
-                                        IKE_SA_INIT (UDP 500, Fortinet VIDs) ──▶
-                                        IKE_AUTH (UDP 4500) + EAP:
-                                          identity = client UID, secret = token ▶
-                                        ◀── PSK AUTH, child SA, IP/DNS/routes
-                                        kernel: XFRM states/policies, fsaml0,
-                                        routes (proto 233), resolvectl DNS
-◀── "@@{json}" status events on stdout   keepalives / DPD until "disconnect"/EOF
+```mermaid
+sequenceDiagram
+    participant GUI as GUI (your user)
+    participant BE as Backend (pkexec)
+    participant CH as charon (private strongSwan)
+    participant FG as FortiGate
+    GUI->>FG: POST /saml_login? UID=…&REDIRECT_PORT=p (HTTPS, SSO port)
+    FG-->>GUI: browser → IdP login → 127.0.0.1:p/?tokenid=…
+    GUI->>BE: stdin: {settings, PSK, token} (checked types)
+    BE->>CH: start with a private config; VICI: connection + secrets, initiate
+    CH->>FG: IKE_SA_INIT, IKE_AUTH + EAP (identity = client UID, secret = token)
+    FG-->>CH: PSK AUTH, child SA, virtual IP, DNS
+    BE->>BE: netlink: fsaml0 (xfrm if_id) before IKE; then address, routes (proto 233)
+    CH->>CH: DNS servers → resolvconf for fsaml0
+    BE->>BE: switch to your user, keep only CAP_NET_ADMIN
+    BE-->>GUI: "@@{json}" status events on stdout
+    CH->>FG: rekeying, dead-peer detection, until "disconnect"/EOF
 ```
 
-- The GUI never runs as root. Root is held only for the length of the connection, by a process that does just IKE and the kernel setup.
-- Secrets (PSK, SSO token, password) reach the backend over a pipe, never on the command line. The stdin pipe then acts as the control channel: a `disconnect` line, or EOF when the GUI exits or crashes, makes the backend clean up and exit.
-- Traffic is encrypted by the kernel. The backend only sends NAT-T keepalives and answers the gateway's dead-peer detection.
+- The GUI never runs as root. The backend is root only while it sets up the tunnel; then it switches to your user and keeps only two capabilities: network admin, to tear the tunnel down again, and kill, to stop its strongSwan instance.
+- IKE, rekeying and the kernel IPsec SAs are handled by strongSwan's charon, run as a private instance with its own config and control socket. It stops when the backend exits.
+- Secrets (PSK, SSO token, password) reach the backend over a pipe, never on the command line, and reach charon over its control socket, never in a file. The stdin pipe then acts as the control channel: a `disconnect` line, or EOF when the GUI exits or crashes, makes the backend clean up and exit.
+- Traffic is encrypted by the kernel.
 
 ### Source layout
 
@@ -101,12 +106,16 @@ pkexec --backend; stdin: {settings, PSK, token}
 | `src/main.rs` | egui UI; dispatches `--backend` / `--probe` / `--down` |
 | `src/config.rs` | profile model, defaults, TOML settings files and state |
 | `src/keyring.rs` | PSK / password storage in the Secret Service |
-| `src/backend.rs` | connection session, pkexec bridge, privileged main loop, probe mode |
+| `src/backend.rs` | connection session, pkexec bridge, privileged session (charon + tunnel + privilege drop), probe mode |
+| `src/charon.rs` | private strongSwan charon: config, start, connection and secrets over VICI, error messages |
+| `src/vici.rs` | strongSwan VICI client |
+| `src/net.rs` | checked value types (interface names, networks, DNS names, proposals, secrets) |
+| `src/netlink.rs` | kernel interface / address / route setup over netlink |
+| `src/resolved.rs` | full tunnel: route all DNS queries to the VPN (systemd-resolved, D-Bus) |
+| `src/privdrop.rs` | switch to the user with only CAP_NET_ADMIN |
+| `src/tunnel.rs` | tunnel plumbing and teardown |
 | `src/saml.rs` | FortiGate SAML flow and local callback server |
 | `src/tls.rs` | rustls HTTPS client with system CAs and AIA intermediate fetching |
-| `src/ike.rs` | IKEv2 initiator: messages, proposals, EAP, AUTH, child SA, Mode Config |
-| `src/crypto.rs` | PRF/prf+, AES-CBC, DH, MD4, MSCHAPv2/MPPE (RustCrypto) |
-| `src/tunnel.rs` | kernel XFRM / routes / DNS setup and cleanup (iproute2, resolvectl) |
 
 ## Configuration and security
 
@@ -124,11 +133,15 @@ pkexec --backend; stdin: {settings, PSK, token}
   - If the FortiGate omits its intermediate certificate, it is fetched via the certificate's AIA URL, like browsers do. Downloaded certificates are only used as untrusted intermediates.
   - With verification off, any certificate is accepted (FortiClient's default behaviour).
 - The pkexec prompt names the binary path. Run the app from a location that only you (or root) can write to.
+- **No shell, no command lines:** the backend configures the kernel over netlink, hands DNS to the standard `resolvconf` (through strongSwan) and controls strongSwan over its VICI socket. Interface names, routes, gateway names and proposals are checked against strict formats before anything runs as root, so a shared profile or a gateway can't inject commands.
+- strongSwan runs as a private instance with its own config and control socket in `/run/fortisaml-gui` (root only), with a fixed plugin list. The PSK and token are handed to it over that socket, never written to a file.
+- Fortinet-specific Mode Config extras (split networks sent as Fortinet attributes, search domain, banner) aren't used: routes come from the traffic selectors or from the custom routes in the profile.
 
 ## Testing
 
 ```bash
-cargo test                       # crypto known-answer tests (RFC 1320/2759/3079/4231, NIST SP 800-38A), parsers
+cargo test                       # unit tests: value checks, VICI, charon config/messages, request building, app
+./scripts/netns-test.sh          # kernel tests, each in a throwaway network namespace (no root needed)
 ```
 
 End-to-end tests run against the mock FortiGate in `../poc/tests/`. The mock is a Python test harness only; the client doesn't depend on it. It offers HTTPS SSO with a fake identity provider and an IKEv2 responder supporting MSCHAPv2/GTC, username/password, and PSK-only:
@@ -155,7 +168,7 @@ Against a real gateway (no root needed, nothing installed): `fortisaml-gui --pro
   - EMS / ZTNA compliance checks
   - Fortinet private notifies (license blob, EMS serial)
 - **One connection at a time.** The xfrm `if_id` and route tag are fixed.
-- **Platform dependencies:** VPN DNS requires systemd-resolved; the root prompt requires a polkit agent.
+- **Platform dependencies:** VPN DNS needs a `resolvconf` implementation (routing all queries through the VPN in full tunnel needs systemd-resolved); the root prompt requires a polkit agent.
 
 ## License
 

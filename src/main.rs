@@ -1,15 +1,20 @@
 //! fortisaml-gui - FortiGate IPsec (IKEv2) + SAML SSO client for Linux, egui front-end.
-//! Everything is native Rust: SAML (saml.rs/tls.rs), IKEv2 (ike.rs/crypto.rs), kernel XFRM (tunnel.rs).
+//! SAML is native Rust (saml.rs/tls.rs); IKEv2 and the XFRM SAs are done by a private strongSwan charon (charon.rs,
+//! vici.rs); the xfrm interface, routes and DNS are set up over netlink and D-Bus (tunnel.rs, netlink.rs, resolved.rs).
 //! The same binary is the privileged backend: `pkexec fortisaml-gui --backend` (see backend.rs).
 
 mod backend;
+mod charon;
 mod config;
-mod crypto;
-mod ike;
 mod keyring;
+mod net;
+mod netlink;
+mod privdrop;
+mod resolved;
 mod saml;
 mod tls;
 mod tunnel;
+mod vici;
 
 #[cfg(test)]
 mod app_tests;
