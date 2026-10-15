@@ -15,7 +15,7 @@ A native Linux client for **FortiGate dial-up IPsec (IKEv2) VPNs with SAML singl
 - **Routing:** split tunnel as pushed by the gateway, full tunnel, or a custom network list. In full-tunnel mode IPv6 is blocked so it can't leak around the VPN.
 - **DNS** from the VPN via systemd-resolved.
 - **Root only while connected:** a `pkexec` prompt appears on Connect, and the GUI itself never runs as root.
-- **Multiple connection profiles**, saved automatically. The PSK and password are encrypted at rest.
+- **Multiple connection profiles**, saved with the Save button. The PSK and password are stored in your desktop keyring.
 
 ## Requirements
 
@@ -23,6 +23,7 @@ A native Linux client for **FortiGate dial-up IPsec (IKEv2) VPNs with SAML singl
 |---|---|
 | OS | Linux with XFRM interface support (kernel ≥ 4.19) |
 | Runtime tools | `pkexec` (polkit) with a desktop polkit agent, `ip` (iproute2), `xdg-open`; `resolvectl` (systemd-resolved) for VPN DNS |
+| Keyring (optional) | a Secret Service provider (GNOME Keyring, KWallet, KeePassXC) to remember the PSK and password; without one they're kept in memory until the app closes |
 | Build | Rust ≥ 1.85 (edition 2024), `cargo` |
 | Display | X11 or Wayland; OpenGL rendering via glow |
 
@@ -116,7 +117,7 @@ The backend reports status events back to the GUI over stdout.
 |---|---|
 | `src/main.rs` | egui UI; dispatches `--backend` / `--probe` / `--down` |
 | `src/config.rs` | profile model, defaults, atomic save |
-| `src/secret.rs` | at-rest encryption of PSK / password |
+| `src/keyring.rs` | PSK / password storage in the Secret Service |
 | `src/backend.rs` | connection session, pkexec bridge, privileged main loop, probe mode |
 | `src/saml.rs` | FortiGate SAML flow and local callback server |
 | `src/tls.rs` | rustls HTTPS client with system CAs and AIA intermediate fetching |
@@ -126,8 +127,8 @@ The backend reports status events back to the GUI over stdout.
 
 ## Configuration and security
 
-- Settings are saved on every change to `~/.config/fortisaml-gui/config.json` (or under `$XDG_CONFIG_HOME`), mode `0600` in a `0700` directory.
-- The **PSK** and a **saved password** are encrypted with AES-256-CBC + HMAC-SHA256 using a key compiled into the binary. **This is obfuscation, not real protection:** anyone with both the file and the binary can decrypt it.
+- Settings are saved when you click **Save** to `~/.config/fortisaml-gui/config.json` (or under `$XDG_CONFIG_HOME`), mode `0600` in a `0700` directory. Closing with unsaved changes asks first.
+- The **PSK** and a **saved password** are not in that file. They're stored in your desktop keyring through the freedesktop Secret Service, as items labelled `FortiSAML VPN: <connection> (PSK)` / `(password)`. Without a Secret Service they're kept in memory until the app closes.
 - A password is stored only if *Save password* is ticked; otherwise it lives in memory until the app closes.
 - The SSO token is single-use and never written to disk.
 - **TLS on the SSO port:**

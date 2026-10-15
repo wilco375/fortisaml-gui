@@ -6,10 +6,13 @@ mod backend;
 mod config;
 mod crypto;
 mod ike;
+mod keyring;
 mod saml;
-mod secret;
 mod tls;
 mod tunnel;
+
+#[cfg(test)]
+mod app_tests;
 
 use backend::{Event, Session};
 use config::*;
@@ -17,6 +20,11 @@ use eframe::egui::{self, Color32, RichText};
 use serde_json::Value;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
+
+/// rustc-style message: "<level>: <headline>" plus a `note` (the cause) and a `help` (what now) line.
+pub fn diag(level: &str, headline: &str, note: &str, help: &str) -> String {
+    format!("{level}: {headline}\n  note: {note}\n  help: {help}")
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum State {
@@ -56,6 +64,13 @@ struct App {
     cfg: Config,
     saved: Config,
     save_error: Option<String>,
+    /// None: no Secret Service this session, secrets stay in memory (see `keyring_warning`)
+    keyring: Option<Box<dyn keyring::SecretStore>>,
+    keyring_warning: Option<String>,
+    /// "Unsaved changes" dialog is open
+    confirm_close: bool,
+    /// the user chose Save or Discard; let the next close request through
+    allow_close: bool,
     state: State,
     session: Option<Session>,
     profile_connected: usize,
@@ -65,6 +80,12 @@ struct App {
     error: Option<String>,
     info: TunnelInfo,
     since: Option<Instant>,
+    /// when Connect was clicked; drives the "no answer yet" notice
+    connect_started: Option<Instant>,
+    /// when the login link was copied; shows "✔ Copied" for a moment
+    copied_at: Option<Instant>,
+    /// SSO login finished in the browser: flash the taskbar entry once (Wayland won't let us raise the window)
+    want_attention: bool,
     show_settings: bool,
     confirm_delete: bool,
     stats: (u64, u64),
@@ -73,12 +94,27 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let cfg = Config::load();
+        let keyring = keyring::SecretServiceStore::connect().map(|s| Box::new(s) as Box<dyn keyring::SecretStore>);
+        Self::with_keyring(Config::load(), keyring)
+    }
+
+    fn with_keyring(mut cfg: Config, keyring: Result<Box<dyn keyring::SecretStore>, keyring::Unavailable>) -> Self {
+        let (keyring, keyring_warning) = match keyring {
+            Ok(s) => (Some(s), None),
+            Err(u) => (None, Some(u.message())),
+        };
+        let read_errors = keyring.as_deref().map(|s| keyring::fill(s, &mut cfg)).unwrap_or_default();
+        let saved = cfg.clone();
+        cfg.dedupe_ids(); // after `saved`: a profile that got a new id is unsaved, Save stores its secrets under it
         let (tx, rx) = channel();
         let mut app = App {
-            saved: cfg.clone(),
+            saved,
             cfg,
-            save_error: None,
+            save_error: (!read_errors.is_empty()).then(|| read_errors.join("\n")),
+            keyring,
+            keyring_warning,
+            confirm_close: false,
+            allow_close: false,
             state: State::Idle,
             session: None,
             profile_connected: 0,
@@ -88,26 +124,87 @@ impl App {
             error: None,
             info: TunnelInfo::default(),
             since: None,
+            connect_started: None,
+            copied_at: None,
+            want_attention: false,
             show_settings: false,
             confirm_delete: false,
             stats: (0, 0),
             stats_at: None,
         };
-        app.persist(); // writes the generated UID on first start
+        if !config_path().exists() {
+            app.save(); // writes the generated UID on first start
+        }
         app
     }
 
-    /// Save immediately whenever anything changed.
-    fn persist(&mut self) {
-        if self.cfg != self.saved || !config_path().exists() {
-            match self.cfg.save() {
-                Ok(()) => {
-                    self.saved = self.cfg.clone();
-                    self.save_error = None;
-                }
-                Err(e) => self.save_error = Some(format!("could not save settings: {e}")),
-            }
+    fn unsaved(&self) -> bool {
+        !self.cfg.settings_eq(&self.saved)
+    }
+
+    /// Save button: write the config file, then bring the keyring in line with it.
+    fn save(&mut self) {
+        if let Err(e) = self.cfg.save() {
+            self.save_error = Some(diag(
+                "error",
+                "the settings couldn't be saved",
+                &e.to_string(),
+                &format!("check that {} is writable and click Save to try again", config_path().display()),
+            ));
+            return;
         }
+        self.save_error = None;
+        match self.keyring.as_deref() {
+            Some(store) => {
+                let ops = keyring::plan(&self.saved, &self.cfg);
+                let (next, errors) = keyring::apply(store, &ops, &self.saved, &self.cfg);
+                self.saved = next;
+                if !errors.is_empty() {
+                    self.save_error = Some(errors.join("\n"));
+                }
+            }
+            None => self.saved = self.cfg.clone(),
+        }
+    }
+
+    /// Ask before closing with unsaved changes.
+    fn close_guard(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.unsaved() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_close = true;
+        }
+        if !self.confirm_close {
+            return;
+        }
+        egui::Window::new("Unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Save your changes before closing?");
+                if let Some(e) = &self.save_error {
+                    ui.label(RichText::new(e).monospace().color(ui.visuals().error_fg_color));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        self.save();
+                        // on failure the dialog stays open with the error; Discard still closes
+                        if !self.unsaved() {
+                            self.confirm_close = false;
+                            self.allow_close = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                    if ui.button("Discard").clicked() {
+                        self.confirm_close = false;
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_close = false;
+                    }
+                });
+            });
     }
 
     fn push_log(&mut self, line: String) {
@@ -131,6 +228,7 @@ impl App {
         self.error = None;
         self.info = TunnelInfo::default();
         self.since = None;
+        self.connect_started = Some(Instant::now());
         self.profile_connected = self.cfg.selected;
         let p = self.cfg.profiles[self.cfg.selected].clone();
         self.push_log(format!("=== connecting \"{}\" ({}) ===", p.name, p.gateway));
@@ -177,7 +275,10 @@ impl App {
         };
         match v.get("event").and_then(|e| e.as_str()).unwrap_or("") {
             "saml_url" => self.info.saml_url = s("url"),
-            "saml_ok" => self.info.username = s("username"),
+            "saml_ok" => {
+                self.info.username = s("username");
+                self.want_attention = true;
+            }
             "ike_start" => self.state = State::Negotiating,
             "established" => {
                 if let Some(c) = v.get("config") {
@@ -275,9 +376,38 @@ fn form_row(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui)) {
     ui.end_row();
 }
 
+/// Text field for a port. Unlike DragValue it never clamps: invalid text keeps the old port and says so.
+fn port_field(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, port: &mut u16) -> egui::Response {
+    ui.push_id(id, |ui| {
+        let key = ui.id().with("text");
+        let mut text = ui.data(|d| d.get_temp::<String>(key)).unwrap_or_else(|| port.to_string());
+        let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(60.0));
+        let parsed = text.trim().parse::<u16>().ok().filter(|&n| n != 0);
+        if let Some(n) = parsed {
+            *port = n;
+        }
+        // keep the text while typing or while it's invalid; otherwise show the stored port
+        let keep = r.has_focus() || parsed.is_none();
+        ui.data_mut(|d| {
+            if keep {
+                d.insert_temp(key, text);
+            } else {
+                d.remove::<String>(key);
+            }
+        });
+        if parsed.is_none() {
+            ui.label(RichText::new(format!("⚠ port must be 1 to 65535, still using {port}")).color(ui.visuals().warn_fg_color));
+        }
+        r
+    })
+    .inner
+}
+
 impl App {
     fn profile_editor(&mut self, ui: &mut egui::Ui) {
+        let keyring_warning = self.keyring_warning.clone();
         let p = &mut self.cfg.profiles[self.cfg.selected];
+        let id = p.id.clone(); // per-profile edit state for the port fields
 
         section(ui, "Connection", true, |ui| {
             egui::Grid::new("general").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
@@ -294,6 +424,9 @@ impl App {
                     ui.add(egui::TextEdit::singleline(&mut p.psk).password(true));
                 });
             });
+            if let Some(w) = &keyring_warning {
+                ui.label(RichText::new(w).monospace().color(ui.visuals().warn_fg_color));
+            }
         });
 
         section(ui, "Authentication", true, |ui| {
@@ -302,8 +435,7 @@ impl App {
             if p.sso_enabled {
                 egui::Grid::new("sso").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                     form_row(ui, "Customize port", |ui| {
-                        ui.add(egui::DragValue::new(&mut p.saml_port).range(1..=65535))
-                            .on_hover_text("FortiGate 'auth-ike-saml-port'");
+                        port_field(ui, ("saml_port", &id), &mut p.saml_port).on_hover_text("FortiGate 'auth-ike-saml-port'");
                     });
                     form_row(ui, "", |ui| {
                         ui.checkbox(&mut p.open_browser, "Open the login page in the browser automatically");
@@ -350,7 +482,7 @@ impl App {
                 form_row(ui, "Encapsulation", |ui| {
                     ui.horizontal(|ui| {
                         ui.label("IKE UDP port");
-                        ui.add(egui::DragValue::new(&mut p.ike_port).range(1..=65535));
+                        port_field(ui, ("ike_port", &id), &mut p.ike_port);
                     });
                 });
             });
@@ -451,9 +583,16 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &root.ctx().clone();
         self.handle_events();
+        if std::mem::take(&mut self.want_attention) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
+        }
         self.read_stats();
         if self.state == State::Connected || self.busy() {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        let save_key = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+        if ctx.input_mut(|i| i.consume_shortcut(&save_key)) && self.unsaved() {
+            self.save();
         }
 
         egui::Panel::top("top").show(root, |ui| {
@@ -465,6 +604,16 @@ impl eframe::App for App {
                         self.show_settings = !self.show_settings;
                     }
                     ui.toggle_value(&mut self.cfg.show_log, "📜 Log");
+                    let shortcut = ctx.format_shortcut(&save_key);
+                    if self.unsaved() {
+                        let b = egui::Button::new(RichText::new("💾 Save changes").strong().color(Color32::WHITE))
+                            .fill(ui.visuals().selection.bg_fill);
+                        if ui.add(b).on_hover_text(format!("Save the settings ({shortcut})")).clicked() {
+                            self.save();
+                        }
+                    } else {
+                        ui.add_enabled(false, egui::Button::new("✔ Saved")).on_disabled_hover_text("No unsaved changes");
+                    }
                 });
             });
         });
@@ -475,17 +624,21 @@ impl eframe::App for App {
             ui.label(RichText::new("VPN connections").strong());
             ui.separator();
             let busy = self.busy();
-            for i in 0..self.cfg.profiles.len() {
-                let p = &self.cfg.profiles[i];
-                let mut text = RichText::new(&p.name);
-                if busy && i == self.profile_connected {
-                    text = text.color(if self.state == State::Connected { Color32::from_rgb(60, 170, 90) } else { Color32::from_rgb(220, 160, 40) });
+            // the list scrolls, so the buttons below stay reachable with many profiles
+            let buttons_h = 8.0 + ui.spacing().item_spacing.y + ui.spacing().interact_size.y;
+            egui::ScrollArea::vertical().max_height(ui.available_height() - buttons_h).show(ui, |ui| {
+                for i in 0..self.cfg.profiles.len() {
+                    let p = &self.cfg.profiles[i];
+                    let mut text = RichText::new(&p.name);
+                    if busy && i == self.profile_connected {
+                        text = text.color(if self.state == State::Connected { Color32::from_rgb(60, 170, 90) } else { Color32::from_rgb(220, 160, 40) });
+                    }
+                    if ui.add_enabled(!busy, egui::Button::selectable(i == self.cfg.selected, text)).clicked() {
+                        self.cfg.selected = i;
+                        self.confirm_delete = false;
+                    }
                 }
-                if ui.add_enabled(!busy, egui::Button::selectable(i == self.cfg.selected, text)).clicked() {
-                    self.cfg.selected = i;
-                    self.confirm_delete = false;
-                }
-            }
+            });
             ui.add_space(8.0);
             ui.add_enabled_ui(!busy, |ui| {
                 ui.horizontal(|ui| {
@@ -493,9 +646,8 @@ impl eframe::App for App {
                         self.cfg.profiles.push(Profile::default());
                         self.cfg.selected = self.cfg.profiles.len() - 1;
                     }
-                    if ui.button("⧉ Copy").clicked() {
-                        let mut p = self.cfg.profiles[self.cfg.selected].clone();
-                        p.name = format!("{} (copy)", p.name);
+                    if ui.button("🗐 Copy").clicked() {
+                        let p = self.cfg.profiles[self.cfg.selected].duplicate();
                         self.cfg.profiles.push(p);
                         self.cfg.selected = self.cfg.profiles.len() - 1;
                     }
@@ -540,12 +692,14 @@ impl eframe::App for App {
             // status / connect bar
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let (dot, col) = match self.state {
-                    State::Connected => ("●", Color32::from_rgb(60, 170, 90)),
-                    State::Idle => ("●", Color32::GRAY),
-                    _ => ("●", Color32::from_rgb(220, 160, 40)),
+                let col = match self.state {
+                    State::Connected => Color32::from_rgb(60, 170, 90),
+                    State::Idle => Color32::GRAY,
+                    _ => Color32::from_rgb(220, 160, 40),
                 };
-                ui.label(RichText::new(dot).color(col).size(20.0));
+                // painted, not a "●" label: the proportional fonts have no glyph for it
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 6.0, col);
                 ui.label(RichText::new(self.state.label()).size(16.0));
                 if self.busy() && self.state != State::Connected {
                     ui.spinner();
@@ -575,19 +729,44 @@ impl eframe::App for App {
                 });
             });
             if let Some(e) = &self.error {
-                ui.colored_label(Color32::LIGHT_RED, format!("⚠ {e}"));
+                if e.starts_with("error:") {
+                    ui.label(RichText::new(e).monospace().color(ui.visuals().error_fg_color));
+                } else {
+                    ui.colored_label(Color32::LIGHT_RED, format!("⚠ {e}"));
+                }
             }
             if let Some(e) = &self.save_error {
-                ui.colored_label(Color32::LIGHT_RED, format!("⚠ {e}"));
+                ui.label(RichText::new(e).monospace().color(ui.visuals().error_fg_color));
             }
             if self.state == State::Authenticating && !self.info.saml_url.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new("Finish signing in in your browser.").strong());
                 ui.horizontal(|ui| {
-                    ui.label("Login page:");
-                    ui.hyperlink_to("open in browser", &self.info.saml_url);
-                    if ui.small_button("copy URL").clicked() {
+                    if ui.button("🌐 Open login page").on_hover_text(&self.info.saml_url).clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(&self.info.saml_url));
+                    }
+                    let copied = self.copied_at.is_some_and(|t| t.elapsed().as_secs() < 2);
+                    if ui.button(if copied { "✔ Copied" } else { "📋 Copy link" })
+                        .on_hover_text("Paste it into the browser where you're signed in")
+                        .clicked()
+                    {
                         ctx.copy_text(self.info.saml_url.clone());
+                        self.copied_at = Some(Instant::now());
+                    }
+                    if copied {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(500));
                     }
                 });
+            } else if self.state == State::Elevating {
+                ui.add_space(4.0);
+                ui.label(RichText::new("🔒 Enter your password in the system prompt.").strong());
+                ui.label("Setting up the VPN tunnel needs administrator rights.");
+            } else if self.state == State::Authenticating && self.connect_started.is_some_and(|t| t.elapsed().as_secs() >= 5) {
+                let p = &self.cfg.profiles[self.profile_connected];
+                ui.label(
+                    RichText::new(format!("⏳ No answer from {}:{} yet. The SSO port may be wrong.", p.gateway.trim(), p.saml_port))
+                        .color(ui.visuals().warn_fg_color),
+                );
             }
             ui.separator();
 
@@ -642,11 +821,10 @@ impl eframe::App for App {
         });
 
         self.settings_window(ctx);
-        self.persist();
+        self.close_guard(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.persist();
         if let Some(s) = self.session.take() {
             s.shutdown(std::time::Duration::from_secs(8));
         }
