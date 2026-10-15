@@ -113,10 +113,12 @@ pub fn config(keepalive_s: u32, verbose: bool, dns_name: Option<&str>) -> String
     filelog {{
         stderr {{
             default = {level}
-            # fd watcher, SA checkout/checkin and job queue: noise even when verbose
+            # fd watcher, SA checkout/checkin, job queue, and the encoder's field-by-field dump of every message
+            # (level 1 keeps one summary line per message): noise even when verbose
             wch = 1
             mgr = 1
             job = 1
+            enc = 1
             ike_name = yes
         }}
     }}
@@ -819,7 +821,8 @@ mod tests {
         // at level 2 the fd watcher, the SA manager's checkout/checkin and the job queue were a quarter of the log
         let c = config(20, true, None);
         assert!(c.contains("default = 2"), "{c}");
-        for quiet in ["wch = 1", "mgr = 1", "job = 1"] {
+        // the encoder at level 2 logs every field of every message; level 1 keeps one summary line per message
+        for quiet in ["wch = 1", "mgr = 1", "job = 1", "enc = 1"] {
             assert!(c.contains(quiet), "missing {quiet:?} in\n{c}");
         }
     }
