@@ -1,4 +1,4 @@
-# FortiSAML VPN
+# Archway
 
 A native Linux client for **FortiGate dial-up IPsec (IKEv2) VPNs with SAML single sign-on**, written in Rust with an [egui](https://github.com/emilk/egui) interface. It supports Fortinet VPN IPsec connections, including SSO, which is not supported by the official FortiClient VPN application on Linux.
 
@@ -30,10 +30,10 @@ A native Linux client for **FortiGate dial-up IPsec (IKEv2) VPNs with SAML singl
 
 ```bash
 cargo build --release
-./target/release/fortisaml-gui
+./target/release/archway-vpn
 ```
 
-The binary is self-contained. When you connect, it starts a second copy of itself as root (`pkexec fortisaml-gui --backend`).
+The binary is self-contained. When you connect, it starts a second copy of itself as root (`pkexec archway-vpn --backend`).
 
 ## Usage
 
@@ -58,10 +58,10 @@ The binary is self-contained. When you connect, it starts a second copy of itsel
 
 | Command | Purpose |
 |---|---|
-| `fortisaml-gui` | Start the GUI |
-| `fortisaml-gui --backend` | Internal: the privileged backend started by pkexec |
+| `archway-vpn` | Start the GUI |
+| `archway-vpn --backend` | Internal: the privileged backend started by pkexec |
 
-Environment: `FORTISAML_BROWSER=<command>` replaces `xdg-open` for opening the SSO page.
+Environment: `ARCHWAY_BROWSER=<command>` replaces `xdg-open` for opening the SSO page.
 
 ## How it works
 
@@ -77,8 +77,8 @@ sequenceDiagram
     BE->>CH: start with a private config; VICI: connection + secrets, initiate
     CH->>FG: IKE_SA_INIT, IKE_AUTH + EAP (identity = client UID, secret = token)
     FG-->>CH: PSK AUTH, child SA, virtual IP, DNS
-    BE->>BE: netlink: fsaml0 (xfrm if_id) before IKE; then address, routes (proto 233)
-    CH->>CH: DNS servers → resolvconf for fsaml0
+    BE->>BE: netlink: archway0 (xfrm if_id) before IKE; then address, routes (proto 233)
+    CH->>CH: DNS servers → resolvconf for archway0
     BE->>BE: switch to your user, keep only CAP_NET_ADMIN
     BE-->>GUI: "@@{json}" status events on stdout
     CH->>FG: rekeying, dead-peer detection, until "disconnect"/EOF
@@ -110,15 +110,15 @@ sequenceDiagram
 
 ## Configuration and security
 
-- Settings are saved when you click **Save**, under `~/.config/fortisaml-gui/` (or `$XDG_CONFIG_HOME`), mode `0600` in a `0700` directory. Closing with unsaved changes asks first.
+- Settings are saved when you click **Save**, under `~/.config/archway-vpn/` (or `$XDG_CONFIG_HOME`), mode `0600` in a `0700` directory. Closing with unsaved changes asks first.
   - `config.toml`: app settings (client UID, verbose logging).
   - `profiles/<connection name>.toml`: one file per connection. To share a connection, click **🔗 Share** and send the file. The recipient puts it in their `profiles/` folder, restarts the app and enters the PSK.
   - Both only contain settings that differ from the defaults.
-- `~/.local/state/fortisaml-gui/state.json` (or `$XDG_STATE_HOME`) holds which connection is selected and the internal ids that link connections to their keyring items. The app manages it; don't edit it.
+- `~/.local/state/archway-vpn/state.json` (or `$XDG_STATE_HOME`) holds which connection is selected and the internal ids that link connections to their keyring items. The app manages it; don't edit it.
 - A connection file that can't be read is reported at startup and left untouched. A `config.toml` that can't be read is reported and replaced when you click **Save**. Older `config.json` files are not read.
 - Every setting is checked when a file is read and while you type. A connection file with an invalid value (an interface name with a space, a route such as `10.1.2.3/16` with host bits set, a username with non-ASCII characters) is reported and left alone. In the editor, a field that's refused says why underneath, and Save and Connect stay disabled until it's fixed; the connection is marked ⚠ in the list.
 - `custom_routes` is a list: `custom_routes = ["10.0.0.0/8", "192.168.10.0/24"]`. Files with the older single string (`"10.0.0.0/8, 192.168.10.0/24"`) still load and are written as a list on the next Save.
-- The **PSK** and a **saved password** are not in these files. They're stored in your desktop keyring through the freedesktop Secret Service, as items labelled `FortiSAML VPN: <connection> (PSK)` / `(password)`. Without a Secret Service they're kept in memory until the app closes.
+- The **PSK** and a **saved password** are not in these files. They're stored in your desktop keyring through the freedesktop Secret Service, as items labelled `Archway VPN: <connection> (PSK)` / `(password)`. Without a Secret Service they're kept in memory until the app closes.
 - A password is stored only if *Save password* is ticked; otherwise it lives in memory until the app closes.
 - The SSO token is single-use and never written to disk.
 - **TLS on the SSO port:**
@@ -127,7 +127,7 @@ sequenceDiagram
   - With verification off, any certificate is accepted (FortiClient's default behaviour).
 - The pkexec prompt names the binary path. Run the app from a location that only you (or root) can write to.
 - **No shell, no command lines:** the backend configures the kernel over netlink, hands DNS to the standard `resolvconf` (through strongSwan) and controls strongSwan over its VICI socket. Interface names, routes, gateway names and proposals are checked against strict formats before anything runs as root, so a shared profile or a gateway can't inject commands.
-- strongSwan runs as a private instance with its own config and control socket in `/run/fortisaml-gui` (root only), with a fixed plugin list. The PSK and token are handed to it over that socket, never written to a file.
+- strongSwan runs as a private instance with its own config and control socket in `/run/archway-vpn` (root only), with a fixed plugin list. The PSK and token are handed to it over that socket, never written to a file.
 - Fortinet-specific Mode Config extras (split networks sent as Fortinet attributes, search domain, banner) aren't used: routes come from the traffic selectors or from the custom routes in the profile.
 
 ## Testing
@@ -137,7 +137,7 @@ cargo test                       # unit tests: value checks, VICI, charon config
 ./scripts/netns-test.sh          # kernel tests, each in a throwaway network namespace (no root needed)
 ```
 
-End-to-end: connect with the app (turn on verbose logging in Settings) and check the tunnel with `ip -br addr show fsaml0` and `ip route show proto 233`.
+End-to-end: connect with the app (turn on verbose logging in Settings) and check the tunnel with `ip -br addr show archway0` and `ip route show proto 233`.
 
 ## Limitations
 
@@ -149,6 +149,10 @@ End-to-end: connect with the app (turn on verbose logging in Settings) and check
   - Fortinet private notifies (license blob, EMS serial)
 - **One connection at a time.** The xfrm `if_id` and route tag are fixed.
 - **Platform dependencies:** VPN DNS needs a `resolvconf` implementation (routing all queries through the VPN in full tunnel needs systemd-resolved); the root prompt requires a polkit agent.
+
+## Trademarks
+
+Fortinet®, FortiGate® and FortiClient® are registered trademarks of Fortinet, Inc. Archway is an independent project: it is not affiliated with, endorsed by or sponsored by Fortinet. These names are used only to say which VPN gateways Archway works with.
 
 ## License
 

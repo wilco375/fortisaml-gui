@@ -275,7 +275,7 @@ extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
 }
 
-/// Entry point for `fortisaml-gui --backend` (run via pkexec).
+/// Entry point for `archway-vpn --backend` (run via pkexec).
 pub fn privileged_main() -> i32 {
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);

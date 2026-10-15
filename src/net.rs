@@ -644,10 +644,10 @@ mod tests {
 
     #[test]
     fn ifname_accepts_normal_names_only() {
-        for ok in ["fsaml0", "vpn_1", "a", "wg-office", "abcdefghijklmno"] {
+        for ok in ["archway0", "vpn_1", "a", "wg-office", "abcdefghijklmno"] {
             assert!(ok.parse::<IfName>().is_ok(), "{ok}");
         }
-        for bad in ["", "-x", "0abc", "x; rm -rf /", "a b", "a/b", "a:b", "abcdefghijklmnop", "fsaml0\n", "é"] {
+        for bad in ["", "-x", "0abc", "x; rm -rf /", "a b", "a/b", "a:b", "abcdefghijklmnop", "archway0\n", "é"] {
             assert!(bad.parse::<IfName>().is_err(), "{bad:?}");
         }
         assert_eq!("-x".parse::<IfName>().unwrap_err(), "Use 1 to 15 letters, digits, _ or -, starting with a letter.");
@@ -718,7 +718,7 @@ mod tests {
     fn serde_rejects_bad_values() {
         assert!(serde_json::from_str::<IfName>("\"x;y\"").is_err());
         assert_eq!(serde_json::from_str::<Ipv4Net>("\"10.0.0.0/8\"").unwrap().to_string(), "10.0.0.0/8");
-        assert_eq!(serde_json::to_string(&"fsaml0".parse::<IfName>().unwrap()).unwrap(), "\"fsaml0\"");
+        assert_eq!(serde_json::to_string(&"archway0".parse::<IfName>().unwrap()).unwrap(), "\"archway0\"");
     }
 
     #[test]

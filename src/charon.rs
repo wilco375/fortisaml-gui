@@ -1,4 +1,4 @@
-//! A private strongSwan charon for one session: our own config and VICI socket under /run/fortisaml-gui, random
+//! A private strongSwan charon for one session: our own config and VICI socket under /run/archway-vpn, random
 //! IKE ports, no routes or addresses of its own (we do those on our xfrm interface), and a plugin allowlist.
 //! Secrets never go into the config file; they're loaded over VICI.
 
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-pub const RUN_DIR: &str = "/run/fortisaml-gui";
+pub const RUN_DIR: &str = "/run/archway-vpn";
 /// Where distros install charon-systemd (Fedora/Arch, Debian/Ubuntu).
 pub const CHARON_PATHS: [&str; 2] = ["/usr/bin/charon-systemd", "/usr/sbin/charon-systemd"];
 /// Plugins we load (plus `resolve` when VPN DNS is wanted); `stats` confirms they loaded.
@@ -24,7 +24,7 @@ pub const PLUGINS: [&str; 10] =
     ["random", "nonce", "openssl", "kernel-netlink", "socket-default", "vici", "eap-identity", "eap-mschapv2", "eap-gtc", "eap-md5"];
 /// Plugins without which a FortiGate SSO connection can't work.
 const REQUIRED: [&str; 5] = ["openssl", "kernel-netlink", "socket-default", "vici", "eap-mschapv2"];
-pub const CONN: &str = "fortisaml";
+pub const CONN: &str = "archway";
 
 pub fn charon_binary() -> Option<&'static str> {
     CHARON_PATHS.into_iter().find(|p| Path::new(p).is_file())
@@ -43,7 +43,7 @@ fn conf_path() -> PathBuf {
     Path::new(RUN_DIR).join("strongswan.conf")
 }
 
-/// Create /run/fortisaml-gui (0700, root only).
+/// Create /run/archway-vpn (0700, root only).
 fn make_run_dir() -> Result<(), String> {
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(RUN_DIR).map_err(|e| format!("{RUN_DIR}: {e}"))
 }
@@ -128,7 +128,7 @@ pub fn config(keepalive_s: u32, verbose: bool, dns_name: Option<&str>) -> String
     )
 }
 
-/// Create /run/fortisaml-gui (0700) and write the config (0600). Returns its path.
+/// Create /run/archway-vpn (0700) and write the config (0600). Returns its path.
 pub fn write_config(contents: &str) -> Result<PathBuf, String> {
     make_run_dir()?;
     let path = conf_path();
@@ -382,9 +382,9 @@ pub fn explain(log: &[String]) -> String {
 pub fn connect(v: &mut Vici, p: &ConnParams, log: &dyn Fn(String)) -> Result<Established, String> {
     let st: Status = v.request(Cmd::LoadConn, &conn_message(p), Duration::from_secs(5), &mut |_, _| {})?;
     st.check("loading the connection")?;
-    let mut shared = vec![Shared { id: "fortisaml-psk", kind: SharedKind::Ike, data: p.psk.expose(), owners: vec![] }];
+    let mut shared = vec![Shared { id: "archway-psk", kind: SharedKind::Ike, data: p.psk.expose(), owners: vec![] }];
     if let ClientAuth::Eap { identity, secret } = &p.auth {
-        shared.push(Shared { id: "fortisaml-eap", kind: SharedKind::Eap, data: secret.expose(), owners: vec![identity.to_string()] });
+        shared.push(Shared { id: "archway-eap", kind: SharedKind::Eap, data: secret.expose(), owners: vec![identity.to_string()] });
     }
     for s in &shared {
         let st: Status = v.request(Cmd::LoadShared, s, Duration::from_secs(5), &mut |_, _| {})?;
@@ -510,7 +510,7 @@ mod tests {
     fn config_has_no_secrets_and_the_right_settings() {
         let c = config(20, false, None);
         for want in ["port = 0", "port_nat_t = 0", "install_routes = no", "install_virtual_ip = no", "keep_alive = 20s",
-                     "socket = unix:///run/fortisaml-gui/charon.vici", "eap-mschapv2"] {
+                     "socket = unix:///run/archway-vpn/charon.vici", "eap-mschapv2"] {
             assert!(c.contains(want), "missing {want:?} in\n{c}");
         }
         assert!(!c.contains("secret"));
@@ -519,21 +519,21 @@ mod tests {
 
     #[test]
     fn resolvconf_name_suits_the_implementation() {
-        let ifn: IfName = "fsaml0".parse().unwrap();
+        let ifn: IfName = "archway0".parse().unwrap();
         // systemd-resolved's resolvconf needs the real interface
-        assert_eq!(resolvconf_name(&ifn, Some(Path::new("/usr/bin/resolvectl"))), "fsaml0");
+        assert_eq!(resolvconf_name(&ifn, Some(Path::new("/usr/bin/resolvectl"))), "archway0");
         // openresolv / Debian resolvconf: a lo.* record sorts before the LAN's, so VPN servers are asked first
-        assert_eq!(resolvconf_name(&ifn, Some(Path::new("/usr/sbin/resolvconf.openresolv"))), "lo.fsaml0");
-        assert_eq!(resolvconf_name(&ifn, None), "lo.fsaml0");
+        assert_eq!(resolvconf_name(&ifn, Some(Path::new("/usr/sbin/resolvconf.openresolv"))), "lo.archway0");
+        assert_eq!(resolvconf_name(&ifn, None), "lo.archway0");
     }
 
     #[test]
     fn config_hands_dns_to_resolvconf_for_our_interface() {
-        let c = config(20, false, Some("lo.fsaml0"));
+        let c = config(20, false, Some("lo.archway0"));
         // iface for strongSwan >= 5.9.9, iface_prefix (prefix + server address) for older versions
-        assert!(c.contains(" resolve ") && c.contains("iface = lo.fsaml0") && c.contains("iface_prefix = lo.fsaml0."), "{c}");
+        assert!(c.contains(" resolve ") && c.contains("iface = lo.archway0") && c.contains("iface_prefix = lo.archway0."), "{c}");
         // without any resolvconf, the resolve plugin would rewrite this file instead: never /etc/resolv.conf
-        assert!(c.contains("file = /run/fortisaml-gui/resolv.conf"), "{c}");
+        assert!(c.contains("file = /run/archway-vpn/resolv.conf"), "{c}");
     }
 
     #[test]
@@ -568,7 +568,7 @@ mod tests {
 
     #[test]
     fn one_session_at_a_time() {
-        let path = std::env::temp_dir().join(format!("fortisaml-lock-test-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("archway-lock-test-{}", std::process::id()));
         let first = lock_at(&path).unwrap();
         assert_eq!(lock_at(&path).unwrap_err(), "a VPN session is already running; disconnect it first");
         drop(first);
@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     fn finds_our_processes_by_their_environment() {
-        let mark = format!("FORTISAML_TEST_MARK={}", std::process::id());
+        let mark = format!("ARCHWAY_TEST_MARK={}", std::process::id());
         let (k, v) = mark.split_once('=').unwrap();
         let mut c = Command::new("sleep").arg("30").env(k, v).spawn().unwrap();
         assert_eq!(pids_with_env(&mark), [c.id() as i32]);
@@ -662,14 +662,14 @@ mod tests {
         #[derive(Serialize)]
         struct Up {
             up: &'static str,
-            fortisaml: Sa,
+            archway: Sa,
         }
         #[derive(Serialize)]
         struct Down {
-            fortisaml: Sa,
+            archway: Sa,
         }
-        assert!(!is_down(&serde_vici::to_vec(&Up { up: "yes", fortisaml: Sa { state: "ESTABLISHED" } }).unwrap()));
-        assert!(is_down(&serde_vici::to_vec(&Down { fortisaml: Sa { state: "DELETING" } }).unwrap()));
+        assert!(!is_down(&serde_vici::to_vec(&Up { up: "yes", archway: Sa { state: "ESTABLISHED" } }).unwrap()));
+        assert!(is_down(&serde_vici::to_vec(&Down { archway: Sa { state: "DELETING" } }).unwrap()));
     }
 
     #[test]
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn list_sa_event_decodes() {
-        // what charon sends: { fortisaml: { local-vips: [10.98.10.1], child-sas: { fortisaml-1: { remote-ts: [0.0.0.0/0] } } } }
+        // what charon sends: { archway: { local-vips: [10.98.10.1], child-sas: { archway-1: { remote-ts: [0.0.0.0/0] } } } }
         #[derive(Serialize)]
         struct C {
             #[serde(rename = "remote-ts")]
@@ -701,14 +701,14 @@ mod tests {
         }
         let body = serde_vici::to_vec(&BTreeMap::from([(
             CONN,
-            I { state: "ESTABLISHED", remote_host: "192.0.2.1", local_vips: vec!["10.98.10.1"], child_sas: BTreeMap::from([("fortisaml-1", C { remote_ts: vec!["10.10.0.0/16", "10.20.0.0/16"] })]) },
+            I { state: "ESTABLISHED", remote_host: "192.0.2.1", local_vips: vec!["10.98.10.1"], child_sas: BTreeMap::from([("archway-1", C { remote_ts: vec!["10.10.0.0/16", "10.20.0.0/16"] })]) },
         )]))
         .unwrap();
         let m: BTreeMap<String, IkeInfo> = serde_vici::from_slice(&body).unwrap();
         let i = &m[CONN];
         assert_eq!(i.local_vips, ["10.98.10.1"]);
         assert_eq!(i.remote_host, "192.0.2.1");
-        assert_eq!(i.child_sas["fortisaml-1"].remote_ts, ["10.10.0.0/16", "10.20.0.0/16"]);
+        assert_eq!(i.child_sas["archway-1"].remote_ts, ["10.10.0.0/16", "10.20.0.0/16"]);
     }
 
     /// Fake charon answering one `list-sas` with a `list-sa` event for `remote_host` with one child SA narrowed to
@@ -743,7 +743,7 @@ mod tests {
             assert_eq!(next(&mut b), Packet::EventRegister(EventName::ListSa), "register for list-sa first");
             b.write_all(&encode(&Packet::EventConfirm)).unwrap();
             assert_eq!(next(&mut b).name(), Some("list-sas"));
-            let child = BTreeMap::from([("fortisaml-1", C { remote_ts })]);
+            let child = BTreeMap::from([("archway-1", C { remote_ts })]);
             let ev = serde_vici::to_vec(&BTreeMap::from([(CONN, I { remote_host, local_vips, child_sas: child })])).unwrap();
             b.write_all(&encode(&Packet::Event { name: EventName::ListSa, body: ev })).unwrap();
             b.write_all(&encode(&Packet::CmdResponse(vec![]))).unwrap();

@@ -250,6 +250,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "archway-vpn"
+version = "0.1.0"
+dependencies = [
+ "async-io",
+ "eframe",
+ "env_logger",
+ "futures-util",
+ "getrandom 0.4.3",
+ "ipnet",
+ "libc",
+ "netlink-packet-route",
+ "netlink-sys",
+ "opener",
+ "rtnetlink",
+ "rustls",
+ "rustls-native-certs",
+ "secret-service",
+ "serde",
+ "serde_json",
+ "serde_vici",
+ "toml",
+ "vec1",
+ "x509-parser",
+ "zbus",
+ "zeroize",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1371,34 +1399,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "fortisaml-gui"
-version = "0.1.0"
-dependencies = [
- "async-io",
- "eframe",
- "env_logger",
- "futures-util",
- "getrandom 0.4.3",
- "ipnet",
- "libc",
- "netlink-packet-route",
- "netlink-sys",
- "opener",
- "rtnetlink",
- "rustls",
- "rustls-native-certs",
- "secret-service",
- "serde",
- "serde_json",
- "serde_vici",
- "toml",
- "vec1",
- "x509-parser",
- "zbus",
- "zeroize",
 ]
 
 [[package]]

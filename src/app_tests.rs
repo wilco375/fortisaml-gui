@@ -21,7 +21,7 @@ impl TempConfig {
         static N: AtomicUsize = AtomicUsize::new(0);
         let lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("fortisaml-gui-test-{}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("archway-vpn-test-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // SAFETY: tests touching the environment hold ENV
         unsafe {
@@ -588,7 +588,7 @@ fn backend_events_drive_the_status() {
     app.on_backend(BackendEvent::IkeStart { gateway: "vpn.example.com".parse().unwrap() });
     assert_eq!(app.state, State::Negotiating);
     let ip = Ipv4Addr::new(10, 98, 0, 2);
-    app.on_backend(BackendEvent::TunnelUp { ifname: "fsaml0".parse().unwrap(), ip, routes: vec!["10.10.0.0/16".parse().unwrap()], full_tunnel: false });
+    app.on_backend(BackendEvent::TunnelUp { ifname: "archway0".parse().unwrap(), ip, routes: vec!["10.10.0.0/16".parse().unwrap()], full_tunnel: false });
     assert_eq!((app.info.ip, app.info.routes.len(), app.info.full_tunnel), (Some(ip), 1, false));
     app.on_backend(BackendEvent::Connected);
     assert_eq!(app.state, State::Connected);

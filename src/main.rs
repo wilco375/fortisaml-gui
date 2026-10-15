@@ -1,7 +1,7 @@
-//! fortisaml-gui - FortiGate IPsec (IKEv2) + SAML SSO client for Linux, egui front-end.
+//! archway-vpn - FortiGate IPsec (IKEv2) + SAML SSO client for Linux, egui front-end.
 //! SAML is native Rust (saml.rs/tls.rs); IKEv2 and the XFRM SAs are done by a private strongSwan charon (charon.rs,
 //! vici.rs); the xfrm interface, routes and DNS are set up over netlink and D-Bus (tunnel.rs, netlink.rs, resolved.rs).
-//! The same binary is the privileged backend: `pkexec fortisaml-gui --backend` (see backend.rs).
+//! The same binary is the privileged backend: `pkexec archway-vpn --backend` (see backend.rs).
 
 mod backend;
 mod charon;
@@ -765,7 +765,7 @@ impl eframe::App for App {
 
         egui::Panel::top("top").show(root, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("FortiSAML VPN");
+                ui.heading("Archway");
                 ui.label(RichText::new("IPsec IKEv2 + SAML SSO").weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("⚙ Settings").clicked() {
@@ -1032,11 +1032,11 @@ fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("FortiSAML VPN")
-            .with_app_id("fortisaml-gui")
+            .with_title("Archway")
+            .with_app_id("archway-vpn")
             .with_inner_size([860.0, 680.0])
             .with_min_inner_size([640.0, 460.0]),
         ..Default::default()
     };
-    eframe::run_native("FortiSAML VPN", opts, Box::new(|_cc| Ok(Box::new(App::new()))))
+    eframe::run_native("Archway", opts, Box::new(|_cc| Ok(Box::new(App::new()))))
 }

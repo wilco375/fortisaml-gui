@@ -212,7 +212,7 @@ impl Default for Network {
             custom_routes: Vec::new(),
             block_ipv6: true,
             set_dns: true,
-            ifname: "fsaml0".parse().expect("valid interface name"),
+            ifname: "archway0".parse().expect("valid interface name"),
             mtu: Mtu::try_from(1400).expect("in range"),
         }
     }
@@ -325,8 +325,8 @@ impl Paths {
     pub fn from_env() -> Self {
         let xdg = |var: &str, fallback: &str| xdg_dir(std::env::var_os(var), std::env::var_os("HOME"), fallback);
         Self {
-            config_dir: xdg("XDG_CONFIG_HOME", ".config").join("fortisaml-gui"),
-            state_dir: xdg("XDG_STATE_HOME", ".local/state").join("fortisaml-gui"),
+            config_dir: xdg("XDG_CONFIG_HOME", ".config").join("archway-vpn"),
+            state_dir: xdg("XDG_STATE_HOME", ".local/state").join("archway-vpn"),
         }
     }
     pub fn config_file(&self) -> PathBuf {
@@ -617,7 +617,7 @@ mod tests {
     impl Tmp {
         fn new() -> Self {
             static N: AtomicUsize = AtomicUsize::new(0);
-            let dir = std::env::temp_dir().join(format!("fortisaml-gui-cfg-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+            let dir = std::env::temp_dir().join(format!("archway-vpn-cfg-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
             let _ = std::fs::remove_dir_all(&dir);
             Self { paths: Paths { config_dir: dir.join("config"), state_dir: dir.join("state") }, dir }
         }
@@ -1069,7 +1069,7 @@ mod tests {
         // the log-file option is gone; a config.toml that still has it loads, and the next Save drops the key
         let t = Tmp::new();
         std::fs::create_dir_all(&t.paths.config_dir).unwrap();
-        std::fs::write(t.paths.config_file(), "uid = \"0123456789ABCDEF0123456789ABCDEF\"\nlog_file = \"~/fortisaml.log\"\n").unwrap();
+        std::fs::write(t.paths.config_file(), "uid = \"0123456789ABCDEF0123456789ABCDEF\"\nlog_file = \"~/archway.log\"\n").unwrap();
         let l = Config::load_from(&t.paths);
         assert!(l.load_errors.is_empty(), "{:?}", l.load_errors);
         l.save_to(&t.paths, &l).unwrap();

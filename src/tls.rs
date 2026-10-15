@@ -27,7 +27,7 @@ fn http_get(url: &str) -> Result<Vec<u8>, String> {
     let host = hostport.split(':').next().unwrap_or(hostport);
     let mut s = TcpStream::connect(&addr).map_err(|e| format!("{addr}: {e}"))?;
     s.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    write!(s, "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: fortisaml\r\n\r\n").map_err(|e| e.to_string())?;
+    write!(s, "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: archway\r\n\r\n").map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     s.read_to_end(&mut buf).map_err(|e| e.to_string())?;
     let (head, body) = split_http(&buf)?;
