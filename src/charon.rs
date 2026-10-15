@@ -31,9 +31,14 @@ pub fn charon_binary() -> Option<&'static str> {
 }
 
 /// What to tell the user when charon-systemd isn't installed.
-pub fn install_hint() -> &'static str {
-    "strongSwan is needed for the IPsec connection; install it: Fedora `sudo dnf install strongswan`, \
-     Debian/Ubuntu `sudo apt install charon-systemd strongswan-swanctl libstrongswan-standard-plugins libcharon-extra-plugins libcharon-extauth-plugins`, Arch `sudo pacman -S strongswan`"
+pub fn install_hint() -> String {
+    crate::diag(
+        "error",
+        "strongSwan isn't installed",
+        "it sets up the IPsec connection",
+        "install it: Fedora `sudo dnf install strongswan`, Debian/Ubuntu `sudo apt install charon-systemd strongswan-swanctl \
+         libstrongswan-standard-plugins libcharon-extra-plugins libcharon-extauth-plugins`, Arch `sudo pacman -S strongswan`",
+    )
 }
 
 pub fn socket_path() -> PathBuf {
@@ -362,20 +367,24 @@ pub struct Established {
     pub remote_ts: Vec<Ipv4Net>,
 }
 
-/// Turn charon's log of a failed `initiate` into a message the user can act on.
+/// Turn charon's log of a failed `initiate` into a message the user can act on (see `diag`).
 pub fn explain(log: &[String]) -> String {
     let has = |s: &str| log.iter().any(|l| l.contains(s));
-    if has("AUTHENTICATION_FAILED") || has("EAP-MS-CHAPv2 failed") || (has("authentication of") && has("failed")) {
-        "authentication failed: the SSO token was rejected or the pre-shared key is wrong".into()
+    let (headline, note, help) = if has("but MAC mismatched") {
+        // the gateway's AUTH payload: it signed with a key other than ours
+        ("the pre-shared key doesn't match the FortiGate's", "the gateway proved who it is with a different key", "check the key under Connection → Pre-shared key")
+    } else if has("AUTHENTICATION_FAILED") || has("EAP-MS-CHAPv2 failed") || (has("authentication of") && has("failed")) {
+        ("the gateway refused the login", "it rejected the SSO token, the username and password, or the pre-shared key", "check the pre-shared key and sign in again")
     } else if has("NO_PROPOSAL_CHOSEN") {
-        "the gateway accepts none of the Phase 1/Phase 2 proposals or DH groups in this profile".into()
+        ("the gateway accepts none of this connection's proposals", "no Phase 1 or Phase 2 proposal or DH group matched the FortiGate's", "compare Advanced → Phase 1 and Phase 2 with the FortiGate's settings")
     } else if has("TS_UNACCEPTABLE") {
-        "the gateway refused the requested networks (traffic selectors)".into()
+        ("the gateway refused the requested networks", "it didn't accept the traffic selectors", "check Advanced → Network → Routing")
     } else if has("giving up after") || has("retransmit") {
-        "no answer from the gateway on the IKE port (check the gateway and IKE port)".into()
+        ("no answer from the gateway", "nothing came back on the IKE port", "check the remote gateway and Advanced → VPN settings → IKE UDP port")
     } else {
-        "the IPsec connection failed; see the log for charon's reason".into()
-    }
+        ("the IPsec connection failed", "charon gave no reason this app recognises", "the log has charon's messages")
+    };
+    crate::diag("error", headline, note, help)
 }
 
 /// Load the connection and secrets, initiate, and return what the gateway assigned. Log lines go to `log`.
@@ -674,11 +683,15 @@ mod tests {
 
     #[test]
     fn errors_are_explained() {
-        assert!(explain(&["received AUTHENTICATION_FAILED notify error".into()]).starts_with("authentication failed"));
-        assert!(explain(&["received NO_PROPOSAL_CHOSEN notify error".into()]).contains("proposals"));
-        assert!(explain(&["giving up after 3 retransmits".into()]).contains("no answer"));
-        assert_eq!(explain(&["received TS_UNACCEPTABLE notify, no CHILD_SA built".into()]), "the gateway refused the requested networks (traffic selectors)");
-        assert!(explain(&[]).contains("see the log"));
+        // like the app's other errors (see `diag`): a headline, then what's wrong and what to do
+        let headline = |log: &[&str]| explain(&log.iter().map(|l| l.to_string()).collect::<Vec<_>>()).lines().next().unwrap().to_string();
+        assert_eq!(headline(&["tried 1 shared key for '192.0.2.8' - '203.0.113.1', but MAC mismatched"]), "error: the pre-shared key doesn't match the FortiGate's");
+        assert_eq!(headline(&["received AUTHENTICATION_FAILED notify error"]), "error: the gateway refused the login");
+        assert_eq!(headline(&["received NO_PROPOSAL_CHOSEN notify error"]), "error: the gateway accepts none of this connection's proposals");
+        assert_eq!(headline(&["giving up after 3 retransmits"]), "error: no answer from the gateway");
+        assert_eq!(headline(&["received TS_UNACCEPTABLE notify, no CHILD_SA built"]), "error: the gateway refused the requested networks");
+        assert_eq!(headline(&[]), "error: the IPsec connection failed");
+        assert!(explain(&[]).contains("\n  note: ") && explain(&[]).contains("\n  help: "));
     }
 
     #[test]
@@ -797,7 +810,7 @@ mod tests {
         let e = connect(&mut v, &params(), &|l| logged.borrow_mut().push(l)).unwrap_err();
         drop(v);
         h.join().unwrap();
-        assert!(e.starts_with("authentication failed"), "{e}");
+        assert!(e.starts_with("error: the gateway refused the login\n"), "{e}");
         assert!(logged.borrow().is_empty(), "{:?}", logged.borrow());
     }
 
