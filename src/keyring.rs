@@ -99,7 +99,7 @@ pub fn plan(saved: &Config, cfg: &Config) -> Vec<Op> {
                 None => !new.is_empty(),
             };
             if changed {
-                ops.push(Op::Set { profile_id: p.id.clone(), kind, label: item_label(&p.name, kind), secret: new.into() });
+                ops.push(Op::Set { profile_id: p.id.clone(), kind, label: item_label(p.name.as_str(), kind), secret: new.into() });
             }
         }
     }
@@ -364,7 +364,7 @@ mod tests {
     }
 
     fn set_op(p: &Profile, kind: Kind, secret: &str) -> Op {
-        Op::Set { profile_id: p.id.clone(), kind, label: item_label(&p.name, kind), secret: secret.into() }
+        Op::Set { profile_id: p.id.clone(), kind, label: item_label(p.name.as_str(), kind), secret: secret.into() }
     }
 
     #[test]
