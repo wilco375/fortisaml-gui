@@ -1,0 +1,47 @@
+# Maintainer: Wilco van Beijnum <github@wilcovanbeijnum.nl>
+# Source build for the AUR.
+# Per release: set pkgver to the release tag without its v (tag v0.2.0 -> pkgver=0.2.0), reset pkgrel to 1.
+pkgname=archway-vpn
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='FortiGate IPsec (IKEv2) VPN client with SAML single sign-on, on strongSwan'
+arch=('x86_64')
+# TODO: change to the Archway repo once it is renamed
+url='https://github.com/wilco375/fortisaml-gui'
+license=('MIT OR Apache-2.0')
+depends=('strongswan' 'polkit' 'wayland' 'libxkbcommon' 'libxkbcommon-x11' 'libx11' 'libxcb' 'libxcursor'
+         'libxi' 'libxrender' 'libglvnd' 'xdg-utils' 'glibc' 'gcc-libs')
+makedepends=('cargo' 'git')
+optdepends=('mesa: OpenGL driver'
+            'org.freedesktop.secrets: stores connection passwords and PSKs')
+# A git source pinned to a tag. VCS sources take SKIP: there is no archive to hash, and git verifies the objects itself. A tag can be moved,
+# so for a stricter pin use #commit=<hash>. (A GitHub tag tarball would have a stable-looking sha256sum, but
+# GitHub does not promise its archives are byte-stable.)
+source=("$pkgname::git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "$pkgname"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgname"
+    export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+    cargo build --frozen --release
+}
+
+check() {
+    cd "$pkgname"
+    export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+    cargo test --frozen
+}
+
+package() {
+    cd "$pkgname"
+    install -Dm755 target/release/archway-vpn "$pkgdir/usr/bin/archway-vpn"
+    install -Dm644 assets/archway-vpn.desktop "$pkgdir/usr/share/applications/archway-vpn.desktop"
+    install -Dm644 assets/archway-vpn.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/archway-vpn.svg"
+    install -Dm644 LICENSE-MIT LICENSE-APACHE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}

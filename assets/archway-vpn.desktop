@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Archway
+GenericName=VPN client
+Comment=Connect to FortiGate IPsec VPNs with SAML single sign-on
+Exec=archway-vpn
+Icon=archway-vpn
+Terminal=false
+Categories=Network;
+Keywords=VPN;IPsec;IKEv2;SAML;SSO;FortiGate;
+StartupWMClass=archway-vpn
