@@ -402,7 +402,7 @@ impl App {
         if self.state != State::Connected {
             return;
         }
-        if self.stats_at.map_or(true, |t| t.elapsed().as_millis() > 900) {
+        if self.stats_at.is_none_or(|t| t.elapsed().as_millis() > 900) {
             let ifn = &self.cfg.profiles[self.profile_connected].network.ifname;
             let rd = |f: &str| {
                 std::fs::read_to_string(format!("/sys/class/net/{ifn}/statistics/{f}"))

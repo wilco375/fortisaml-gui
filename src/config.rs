@@ -2,6 +2,7 @@
 //! - config.toml: app settings; profiles/<name>.toml: one per connection, shareable by copying the file.
 //!   Both only hold values that differ from the default.
 //! - state.json in the XDG state dir: profile ids (the keyring key), selection, log panel. App-only.
+//!
 //! The PSK and password are not in these files: they live in the Secret Service (see keyring.rs).
 //!
 //! Every setting has a checked type (net.rs): a file with a bad value is reported and not loaded.
@@ -668,8 +669,7 @@ mod tests {
     #[test]
     fn rename_and_remove_delete_old_files_but_a_swap_deletes_nothing() {
         let t = Tmp::new();
-        let mut saved = Config::default();
-        saved.profiles = vec![profile("A"), profile("B"), profile("C")];
+        let saved = Config { profiles: vec![profile("A"), profile("B"), profile("C")], ..Config::default() };
         saved.save_to(&t.paths, &saved).unwrap();
         let mut c = saved.clone();
         c.profiles[0].name = "B".into();
@@ -704,8 +704,7 @@ mod tests {
     #[test]
     fn vanished_and_renamed_files_leave_orphan_ids() {
         let t = Tmp::new();
-        let mut c = Config::default();
-        c.profiles = vec![profile("A"), profile("B"), profile("C")];
+        let c = Config { profiles: vec![profile("A"), profile("B"), profile("C")], ..Config::default() };
         c.save_to(&t.paths, &c).unwrap();
         std::fs::remove_file(t.paths.profile_file("A")).unwrap();
         std::fs::rename(t.paths.profile_file("B"), t.paths.profile_file("B2")).unwrap();
@@ -726,7 +725,7 @@ mod tests {
         std::fs::create_dir_all(&t.paths.state_dir).unwrap();
         std::fs::write(t.paths.state_file(), format!(r#"{{"ids":{{"Office":"{id}"}},"orphans":["{orphan}"]}}"#)).unwrap();
         let l = Config::load_from(&t.paths);
-        assert_eq!(l.orphans, [orphan.clone()], "only the recorded orphans");
+        assert_eq!(l.orphans, std::slice::from_ref(&orphan), "only the recorded orphans");
         assert!(l.load_errors.is_empty(), "{:?}", l.load_errors);
         std::fs::create_dir_all(&t.paths.config_dir).unwrap();
         std::fs::write(t.paths.profiles_dir(), "").unwrap(); // a file: listing fails with something other than NotFound
@@ -889,8 +888,7 @@ mod tests {
     #[test]
     fn save_then_load_keeps_settings_ids_and_selection() {
         let t = Tmp::new();
-        let mut c = Config::default();
-        c.profiles = vec![profile("B"), profile("A")];
+        let mut c = Config { profiles: vec![profile("B"), profile("A")], ..Config::default() };
         c.profiles[0].gateway = Some("b.example".parse().unwrap());
         c.selected = 0; // "B"
         c.show_log = false;
@@ -950,9 +948,7 @@ mod tests {
 
     #[test]
     fn duplicate_gets_new_id() {
-        let mut p = Profile::default();
-        p.name = "Office".into();
-        p.psk = "k".into();
+        let p = Profile { name: "Office".into(), psk: "k".into(), ..Profile::default() };
         let d = p.duplicate();
         assert_ne!(d.id, p.id);
         assert_eq!(d.name.as_str(), "Office (copy)");
@@ -983,8 +979,7 @@ mod tests {
 
     #[test]
     fn name_errors_report_clashing_and_unreadable_names() {
-        let mut c = Config::default();
-        c.profiles = ["Office", "Office", "Broken", "fine"].map(profile).to_vec();
+        let mut c = Config { profiles: ["Office", "Office", "Broken", "fine"].map(profile).to_vec(), ..Config::default() };
         c.unreadable.insert("Broken".into(), new_uid());
         let errors = c.name_errors();
         assert_eq!(errors.len(), 2, "{errors:#?}");

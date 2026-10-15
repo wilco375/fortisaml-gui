@@ -73,14 +73,13 @@ fn certs_from_blob(data: &[u8]) -> Vec<CertificateDer<'static>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < data.len() {
-        if data[i] == 0x30 {
-            if let Ok((rest, _)) = x509_parser::parse_x509_certificate(&data[i..]) {
+        if data[i] == 0x30
+            && let Ok((rest, _)) = x509_parser::parse_x509_certificate(&data[i..]) {
                 let used = data.len() - i - rest.len();
                 out.push(CertificateDer::from(data[i..i + used].to_vec()));
                 i += used;
                 continue;
             }
-        }
         i += 1;
     }
     out
@@ -93,13 +92,11 @@ fn aia_issuer_urls(der: &[u8]) -> Vec<String> {
     for ext in cert.extensions() {
         if let ParsedExtension::AuthorityInfoAccess(aia) = ext.parsed_extension() {
             for d in &aia.accessdescs {
-                if d.access_method == x509_parser::oid_registry::OID_PKIX_ACCESS_DESCRIPTOR_CA_ISSUERS {
-                    if let GeneralName::URI(u) = d.access_location {
-                        if u.starts_with("http://") {
+                if d.access_method == x509_parser::oid_registry::OID_PKIX_ACCESS_DESCRIPTOR_CA_ISSUERS
+                    && let GeneralName::URI(u) = d.access_location
+                        && u.starts_with("http://") {
                             urls.push(u.to_string());
                         }
-                    }
-                }
             }
         }
     }

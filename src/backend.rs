@@ -83,11 +83,10 @@ impl Session {
             std::thread::sleep(Duration::from_millis(50));
         }
         self.shared.lock().unwrap().backend_stdin.take(); // EOF => backend tears down regardless
-        if let Some(t) = self.thread.take() {
-            if t.is_finished() {
+        if let Some(t) = self.thread.take()
+            && t.is_finished() {
                 let _ = t.join();
             }
-        }
     }
 }
 
@@ -208,11 +207,10 @@ fn run_backend(req: &BackendRequest, shared: &Arc<Mutex<Shared>>, cancel: &Arc<A
     stdin.write_all(line.as_bytes()).map_err(|e| format!("backend stdin: {e}"))?;
     stdin.flush().ok();
     shared.lock().unwrap().backend_stdin = Some(stdin);
-    if cancel.load(Ordering::SeqCst) {
-        if let Some(s) = shared.lock().unwrap().backend_stdin.as_mut() {
+    if cancel.load(Ordering::SeqCst)
+        && let Some(s) = shared.lock().unwrap().backend_stdin.as_mut() {
             let _ = s.write_all(b"disconnect\n");
         }
-    }
     let stderr = child.stderr.take().unwrap();
     let s4 = send.clone();
     let eth = std::thread::spawn(move || {

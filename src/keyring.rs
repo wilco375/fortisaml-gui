@@ -227,7 +227,7 @@ pub struct SecretServiceStore {
     ss: SecretService<'static>,
 }
 
-fn attrs<'a>(profile_id: &'a str, kind: Option<Kind>) -> HashMap<&'a str, &'a str> {
+fn attrs(profile_id: &str, kind: Option<Kind>) -> HashMap<&str, &str> {
     let mut a = HashMap::from([("application", "fortisaml-gui"), ("profile", profile_id)]);
     if let Some(k) = kind {
         a.insert("kind", k.attr());
@@ -318,10 +318,13 @@ pub mod testing {
     use std::collections::HashMap;
     use std::rc::Rc;
 
-    /// (profile id, kind) -> (label, secret), shared between clones; `fail` makes every write of that kind fail.
+    /// (profile id, kind attribute) -> (label, secret)
+    type Items = HashMap<(String, &'static str), (String, String)>;
+
+    /// Items shared between clones; `fail` makes every write of that kind fail.
     #[derive(Clone, Default)]
     pub struct MemoryStore {
-        pub items: Rc<RefCell<HashMap<(String, &'static str), (String, String)>>>,
+        pub items: Rc<RefCell<Items>>,
         pub fail: Option<Kind>,
         pub fail_delete: bool,
     }
