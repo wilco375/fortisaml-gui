@@ -3,58 +3,29 @@
 //!   Both only hold values that differ from the default.
 //! - state.json in the XDG state dir: profile ids (the keyring key), selection, log panel. App-only.
 //! The PSK and password are not in these files: they live in the Secret Service (see keyring.rs).
+//!
+//! Every setting has a checked type (net.rs): a file with a bad value is reported and not loaded.
 
+use crate::net::{
+    ClientUid, Description, DhGroup, Encryption, Hash, Host, IfName, Ipv4Net, Keepalive, LocalId, LoginTimeout, Mtu, Port, ProfileName,
+    Proposal, Username,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub const ENCRYPTIONS: [&str; 3] = ["AES128", "AES192", "AES256"];
-pub const HASHES: [&str; 4] = ["SHA1", "SHA256", "SHA384", "SHA512"];
-/// DH groups the backend implements (MODP2048, ECP256/384/521).
-pub const DH_SUPPORTED: [u16; 4] = [14, 19, 20, 21];
 /// Groups shown by the official client but not implemented here (rendered disabled).
 pub const DH_UNSUPPORTED: [u16; 8] = [1, 2, 5, 15, 16, 17, 18, 31];
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Proposal {
-    pub enc: String,
-    pub hash: String,
-}
+/// What `Profile::problems` reports; the editor shows the same text in place.
+pub const NO_P1_PROPOSAL: &str = "Select at least one Phase 1 proposal.";
+pub const NO_DH_GROUP: &str = "Select at least one DH group.";
+pub const NO_P2_PROPOSAL: &str = "Select at least one Phase 2 proposal.";
+pub const NO_ROUTES: &str = "Enter at least one network, or choose another routing option.";
 
-impl Proposal {
-    pub fn new(enc: &str, hash: &str) -> Self {
-        Self { enc: enc.into(), hash: hash.into() }
-    }
-    pub fn spec(&self) -> String {
-        format!("{}-{}", self.enc.to_lowercase(), self.hash.to_lowercase())
-    }
-}
-
-/// In profile files a proposal is its `spec()`: "aes128-sha1".
-impl Serialize for Proposal {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.spec())
-    }
-}
-
-impl<'de> Deserialize<'de> for Proposal {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        let (enc, hash) = s.split_once('-').unwrap_or((&s, ""));
-        let (enc, hash) = (enc.to_uppercase(), hash.to_uppercase());
-        if ENCRYPTIONS.contains(&enc.as_str()) && HASHES.contains(&hash.as_str()) {
-            return Ok(Proposal::new(&enc, &hash));
-        }
-        let lower = |v: &[&str]| v.iter().map(|x| x.to_lowercase()).collect::<Vec<_>>().join(", ");
-        Err(serde::de::Error::custom(format!(
-            "invalid proposal \"{s}\", expected encryption-hash like \"aes128-sha1\" (encryption: {}; hash: {})",
-            lower(&ENCRYPTIONS),
-            lower(&HASHES)
-        )))
-    }
-}
+const RNG_FAILED: &str = "the system random number generator works";
 
 /// User authentication when SSO is disabled.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -84,9 +55,10 @@ pub struct Profile {
     pub id: String,
     /// the profile file's name without `.toml`
     #[serde(skip)]
-    pub name: String,
-    pub description: String,
-    pub gateway: String,
+    pub name: ProfileName,
+    pub description: Description,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "empty_as_none")]
+    pub gateway: Option<Host>,
     /// stored in the Secret Service, never in the profile file (see keyring.rs)
     #[serde(skip)]
     pub psk: String,
@@ -105,17 +77,18 @@ pub struct Profile {
 #[serde(default)]
 pub struct Sso {
     pub enabled: bool,
-    pub port: u16,
+    pub port: Port,
     pub open_browser: bool,
     pub verify_cert: bool,
-    pub timeout: u32,
+    pub timeout: LoginTimeout,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Auth {
     pub mode: UserAuth,
-    pub username: String,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "empty_as_none")]
+    pub username: Option<Username>,
     /// stored in the Secret Service only if `save_password`, never in the profile file
     #[serde(skip)]
     pub password: String,
@@ -125,11 +98,12 @@ pub struct Auth {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Ike {
-    pub port: u16,
+    pub port: Port,
     pub proposals: Vec<Proposal>,
-    pub dh_groups: Vec<u16>,
-    pub local_id: String,
-    pub natt_keepalive: u32,
+    pub dh_groups: Vec<DhGroup>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "empty_as_none")]
+    pub local_id: Option<LocalId>,
+    pub natt_keepalive: Keepalive,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -142,20 +116,54 @@ pub struct Esp {
 #[serde(default)]
 pub struct Network {
     pub route_mode: RouteMode,
-    pub custom_routes: String,
+    #[serde(deserialize_with = "routes_compat")]
+    pub custom_routes: Vec<Ipv4Net>,
     pub block_ipv6: bool,
     pub set_dns: bool,
-    pub ifname: String,
-    pub mtu: u16,
+    pub ifname: IfName,
+    pub mtu: Mtu,
+}
+
+/// `custom_routes` is an array of networks. Files written before that hold one string separated by commas or
+/// spaces; those are still read (and written back as an array by the next Save).
+fn routes_compat<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Ipv4Net>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        List(Vec<String>),
+        Text(String),
+    }
+    let routes = match Raw::deserialize(d)? {
+        Raw::List(v) => v.iter().map(|s| s.parse()).collect::<Result<Vec<_>, String>>(),
+        Raw::Text(s) => Ipv4Net::parse_list(&s),
+    };
+    routes.map_err(serde::de::Error::custom)
+}
+
+/// An optional text setting. Older versions wrote a cleared field as `""`: an empty (or blank) string is not set.
+fn empty_as_none<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: TryFrom<String, Error = String>,
+{
+    match Option::<String>::deserialize(d)? {
+        Some(s) if !s.trim().is_empty() => T::try_from(s).map(Some).map_err(serde::de::Error::custom),
+        _ => Ok(None),
+    }
+}
+
+/// FortiClient's defaults: AES128-SHA1 and AES256-SHA256.
+fn default_proposals() -> Vec<Proposal> {
+    vec![Proposal { enc: Encryption::Aes128, hash: Hash::Sha1 }, Proposal { enc: Encryption::Aes256, hash: Hash::Sha256 }]
 }
 
 impl Default for Profile {
     fn default() -> Self {
         Self {
             id: new_uid(),
-            name: "New connection".into(),
-            description: String::new(),
-            gateway: String::new(),
+            name: ProfileName::default(),
+            description: Description::default(),
+            gateway: None,
             psk: String::new(),
             sso: Sso::default(),
             auth: Auth::default(),
@@ -168,45 +176,69 @@ impl Default for Profile {
 
 impl Default for Sso {
     fn default() -> Self {
-        Self { enabled: true, port: 443, open_browser: true, verify_cert: false, timeout: 300 }
+        Self { enabled: true, port: Port::new(443).expect("nonzero"), open_browser: true, verify_cert: false, timeout: LoginTimeout::try_from(300).expect("in range") }
     }
 }
 
 impl Default for Auth {
     fn default() -> Self {
-        Self { mode: UserAuth::Eap, username: String::new(), password: String::new(), save_password: false }
+        Self { mode: UserAuth::Eap, username: None, password: String::new(), save_password: false }
     }
 }
 
 impl Default for Ike {
     fn default() -> Self {
         Self {
-            port: 500,
-            // FortiClient GUI defaults
-            proposals: vec![Proposal::new("AES128", "SHA1"), Proposal::new("AES256", "SHA256")],
-            dh_groups: vec![20],
-            local_id: String::new(),
-            natt_keepalive: 20,
+            port: Port::new(500).expect("nonzero"),
+            proposals: default_proposals(),
+            dh_groups: vec![DhGroup::Ecp384],
+            local_id: None,
+            natt_keepalive: Keepalive::try_from(20).expect("in range"),
         }
     }
 }
 
 impl Default for Esp {
     fn default() -> Self {
-        Self { proposals: vec![Proposal::new("AES128", "SHA1"), Proposal::new("AES256", "SHA256")] }
+        Self { proposals: default_proposals() }
     }
 }
 
 impl Default for Network {
     fn default() -> Self {
-        Self { route_mode: RouteMode::Gateway, custom_routes: String::new(), block_ipv6: true, set_dns: true, ifname: "fsaml0".into(), mtu: 1400 }
+        Self {
+            route_mode: RouteMode::Gateway,
+            custom_routes: Vec::new(),
+            block_ipv6: true,
+            set_dns: true,
+            ifname: "fsaml0".parse().expect("valid interface name"),
+            mtu: Mtu::try_from(1400).expect("in range"),
+        }
     }
 }
 
 impl Profile {
     /// Copy under a new id, so it doesn't share keyring items with the original.
     pub fn duplicate(&self) -> Self {
-        Self { id: new_uid(), name: format!("{} (copy)", self.name), ..self.clone() }
+        Self { id: new_uid(), name: self.name.with_suffix(" (copy)"), ..self.clone() }
+    }
+
+    /// What must be fixed before this profile can be saved or used, beyond what its field types already guarantee.
+    pub fn problems(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.ike.proposals.is_empty() {
+            v.push(NO_P1_PROPOSAL);
+        }
+        if self.ike.dh_groups.is_empty() {
+            v.push(NO_DH_GROUP);
+        }
+        if self.esp.proposals.is_empty() {
+            v.push(NO_P2_PROPOSAL);
+        }
+        if self.network.route_mode == RouteMode::Custom && self.network.custom_routes.is_empty() {
+            v.push(NO_ROUTES);
+        }
+        v
     }
 }
 
@@ -215,14 +247,15 @@ pub struct Config {
     pub profiles: Vec<Profile>,
     pub selected: usize,
     /// FortiClient installation UID presented to the FortiGate (SAML UID + EAP identity)
-    pub uid: String,
+    pub uid: ClientUid,
     pub verbose: bool,
-    pub log_file: String,
     pub show_log: bool,
     /// profile files that couldn't be parsed: name -> id; Save leaves them alone
     pub unreadable: BTreeMap<String, String>,
     /// keyring ids whose profile file is gone; Save deletes their keyring items
     pub orphans: Vec<String>,
+    /// ids of profiles whose file is in an older format (e.g. `custom_routes = ""`); Save rewrites them
+    pub outdated: HashSet<String>,
     /// problems `load` found, shown at startup
     pub load_errors: Vec<String>,
 }
@@ -232,24 +265,23 @@ impl Default for Config {
         Self {
             profiles: vec![Profile::default()],
             selected: 0,
-            uid: new_uid(),
+            uid: ClientUid::generate().expect(RNG_FAILED),
             verbose: false,
-            log_file: String::new(),
             show_log: true,
             unreadable: BTreeMap::new(),
             orphans: Vec::new(),
+            outdated: HashSet::new(),
             load_errors: Vec::new(),
         }
     }
 }
 
-/// config.toml
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct AppFile {
-    uid: String,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "empty_as_none")]
+    uid: Option<ClientUid>,
     verbose: bool,
-    log_file: String,
 }
 
 /// state.json
@@ -270,13 +302,10 @@ impl Default for StateFile {
     }
 }
 
+/// A fresh random id (profile keyring keys). Panics only if the OS random number generator fails, instead of
+/// silently handing out a fixed id.
 pub fn new_uid() -> String {
-    let mut b = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let _ = f.read_exact(&mut b);
-    }
-    b.iter().map(|x| format!("{x:02X}")).collect()
+    ClientUid::generate().expect(RNG_FAILED).to_string()
 }
 
 /// Where the files live: the XDG dirs in the app, temp dirs in tests.
@@ -333,9 +362,22 @@ fn sparse<T: Serialize + Default>(v: &T) -> String {
     toml::to_string(&t).expect("a TOML table serializes")
 }
 
+/// Whether the file at `path` holds `p` in another form than Save writes now (an older format, such as
+/// `custom_routes = ""`, or defaults written out). Comments and key order don't count: those files are left alone.
+fn is_outdated(path: &Path, p: &Profile) -> bool {
+    let table = |s: &str| toml::from_str::<toml::Table>(s).ok();
+    std::fs::read_to_string(path).is_ok_and(|text| table(&text) != table(&sparse(p)))
+}
+
 /// A profile file's settings; id and name are left for the caller.
 fn parse_profile(s: &str) -> Result<Profile, String> {
     toml::from_str(s).map_err(|e| e.to_string())
+}
+
+/// `e` with every line cut at 200 characters: the TOML parser quotes the offending line, which can be megabytes long.
+fn shorten(e: &str) -> String {
+    let line = |l: &str| if l.chars().count() > 200 { format!("{}…", l.chars().take(200).collect::<String>()) } else { l.to_string() };
+    e.trim_end().lines().map(line).collect::<Vec<_>>().join("\n")
 }
 
 /// Parse the file at `path`. Missing: None. Unreadable or invalid: None plus a message with `help`.
@@ -344,7 +386,7 @@ fn read<T>(path: &Path, parse: impl FnOnce(&str) -> Result<T, String>, help: &st
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         r => r.map_err(|e| e.to_string()).and_then(|s| parse(&s)),
     };
-    parsed.map_err(|e| errors.push(crate::diag("error", &format!("{} couldn't be read", path.display()), e.trim_end(), help))).ok()
+    parsed.map_err(|e| errors.push(crate::diag("error", &format!("{} couldn't be read", path.display()), &shorten(&e), help))).ok()
 }
 
 /// Atomic write with 0600 permissions, in a 0700 directory.
@@ -367,21 +409,6 @@ fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
     run().map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Why `name` can't be a profile file name, if it can't.
-fn name_problem(name: &str) -> Option<&'static str> {
-    if name.trim().is_empty() {
-        Some("Name cannot be empty.")
-    } else if name.contains(['/', '\0']) {
-        Some("Name cannot contain a '/'.")
-    } else if name.starts_with('.') {
-        Some("Name cannot start with a '.'.")
-    } else if name.len() > 100 {
-        Some("Name is too long.")
-    } else {
-        None
-    }
-}
-
 impl Config {
     /// One message per profile whose name can't be saved as a file; Save refuses while there are any.
     pub fn name_errors(&self) -> Vec<String> {
@@ -396,26 +423,26 @@ impl Config {
             .collect()
     }
 
-    /// Per profile: why its name can't be saved as a file, if it can't. The editor shows it next to the name.
+    /// Per profile: why its name can't be saved, if it can't (the per-name rules are in `ProfileName`).
     pub fn name_problems(&self) -> Vec<Option<&'static str>> {
         let mut seen = HashSet::new();
         self.profiles
             .iter()
             .map(|p| {
-                name_problem(&p.name)
-                    .or_else(|| (!seen.insert(p.name.as_str())).then_some("Another connection already has this name."))
-                    .or_else(|| self.unreadable.contains_key(&p.name).then_some("A connection file with this name couldn't be read."))
+                (!seen.insert(&p.name))
+                    .then_some("Another connection already has this name.")
+                    .or_else(|| self.unreadable.contains_key(p.name.as_str()).then_some("A connection file with this name couldn't be read."))
             })
             .collect()
     }
 
     /// `base`, or `base 2`, `base 3`, ...: the first name no profile (or unreadable file) uses.
-    pub fn unique_name(&self, base: &str) -> String {
-        let taken = |n: &str| self.profiles.iter().any(|p| p.name == n) || self.unreadable.contains_key(n);
+    pub fn unique_name(&self, base: &ProfileName) -> ProfileName {
+        let taken = |n: &ProfileName| self.profiles.iter().any(|p| &p.name == n) || self.unreadable.contains_key(n.as_str());
         if !taken(base) {
-            return base.into();
+            return base.clone();
         }
-        (2..).map(|i| format!("{base} {i}")).find(|n| !taken(n)).expect("a free name")
+        (2..).map(|i| base.with_suffix(&format!(" {i}"))).find(|n| !taken(n)).expect("a free name")
     }
 
     pub fn load() -> Self {
@@ -454,14 +481,28 @@ impl Config {
         files.sort();
         let mut profiles = Vec::new();
         let mut unreadable = BTreeMap::new();
+        let mut outdated = HashSet::new();
         for path in files {
-            let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else { continue };
-            let id = state.ids.get(&name).cloned().unwrap_or_else(new_uid);
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else { continue };
+            let id = state.ids.get(&stem).cloned().unwrap_or_else(new_uid);
+            let name = match stem.parse::<ProfileName>() {
+                Ok(n) => n,
+                Err(why) => {
+                    errors.push(crate::diag("error", &format!("{} couldn't be read", path.display()), &why, "rename the file; until then Save leaves it alone"));
+                    unreadable.insert(stem, id);
+                    continue;
+                }
+            };
             let help = "fix the file; until then Save leaves it alone";
             match read(&path, parse_profile, help, &mut errors) {
-                Some(p) => profiles.push(Profile { id, name, ..p }),
+                Some(p) => {
+                    if is_outdated(&path, &p) {
+                        outdated.insert(id.clone());
+                    }
+                    profiles.push(Profile { id, name, ..p })
+                }
                 None => {
-                    unreadable.insert(name, id);
+                    unreadable.insert(stem, id);
                 }
             }
         }
@@ -469,7 +510,12 @@ impl Config {
 
         // ids whose file is gone (deleted or renamed by hand): Save removes their keyring items
         let in_use: HashSet<&String> = profiles.iter().map(|p| &p.id).chain(unreadable.values()).collect();
-        let gone = state.ids.iter().filter(|_| listed).filter(|(n, _)| !profiles.iter().any(|p| &p.name == *n) && !unreadable.contains_key(*n)).map(|(_, id)| id);
+        let gone = state
+            .ids
+            .iter()
+            .filter(|_| listed)
+            .filter(|(n, _)| !profiles.iter().any(|p| p.name.as_str() == n.as_str()) && !unreadable.contains_key(*n))
+            .map(|(_, id)| id);
         let mut orphans: Vec<String> = state.orphans.iter().chain(gone).filter(|id| !in_use.contains(id)).cloned().collect();
         orphans.sort();
         orphans.dedup();
@@ -477,16 +523,16 @@ impl Config {
         if profiles.is_empty() {
             profiles.push(Profile::default());
         }
-        let selected = profiles.iter().position(|p| p.name == state.selected).unwrap_or(0);
+        let selected = profiles.iter().position(|p| p.name.as_str() == state.selected).unwrap_or(0);
         Config {
             profiles,
             selected,
-            uid: if app.uid.len() == 32 { app.uid } else { new_uid() },
+            uid: app.uid.unwrap_or_else(|| ClientUid::generate().expect(RNG_FAILED)),
             verbose: app.verbose,
-            log_file: app.log_file,
             show_log: state.show_log,
             unreadable,
             orphans,
+            outdated,
             load_errors: errors,
         }
     }
@@ -511,6 +557,7 @@ impl Config {
             c.show_log = false;
             c.unreadable.clear();
             c.orphans.clear();
+            c.outdated.clear();
             c.load_errors.clear();
             for p in c.profiles.iter_mut().filter(|p| !p.auth.save_password) {
                 p.auth.password.clear();
@@ -530,22 +577,22 @@ impl Config {
     /// profile file, never state.json mapping an id to a name whose file is gone. Errors name the failing path.
     pub fn save_to(&self, paths: &Paths, saved: &Config) -> Result<(), String> {
         for p in &self.profiles {
-            let path = paths.profile_file(&p.name);
-            if !(saved.profiles.contains(p) && path.exists()) {
+            let path = paths.profile_file(p.name.as_str());
+            if !(saved.profiles.contains(p) && path.exists()) || self.outdated.contains(&p.id) {
                 write_private(&path, sparse(p).as_bytes())?;
             }
         }
         let state = StateFile {
-            ids: self.profiles.iter().map(|p| (p.name.clone(), p.id.clone())).chain(self.unreadable.clone()).collect(),
+            ids: self.profiles.iter().map(|p| (p.name.to_string(), p.id.clone())).chain(self.unreadable.clone()).collect(),
             orphans: self.orphans.clone(),
-            selected: self.profiles.get(self.selected).map(|p| p.name.clone()).unwrap_or_default(),
+            selected: self.profiles.get(self.selected).map(|p| p.name.to_string()).unwrap_or_default(),
             show_log: self.show_log,
         };
         write_private(&paths.state_file(), serde_json::to_string_pretty(&state).expect("state serializes").as_bytes())?;
-        let app = AppFile { uid: self.uid.clone(), verbose: self.verbose, log_file: self.log_file.clone() };
+        let app = AppFile { uid: Some(self.uid), verbose: self.verbose };
         write_private(&paths.config_file(), sparse(&app).as_bytes())?;
         for o in saved.profiles.iter().filter(|o| !self.profiles.iter().any(|p| p.name == o.name)) {
-            let path = paths.profile_file(&o.name);
+            let path = paths.profile_file(o.name.as_str());
             match std::fs::remove_file(&path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("{}: {e}", path.display())),
                 _ => {}
@@ -599,103 +646,12 @@ mod tests {
     }
 
     #[test]
-    fn changed_profile_fields_round_trip() {
-        let mut p = profile("Office");
-        p.gateway = "vpn.example.com".into();
-        p.sso.port = 10443;
-        p.auth.mode = UserAuth::None;
-        p.ike.proposals = vec![Proposal::new("AES256", "SHA512")];
-        p.ike.dh_groups = vec![20, 21];
-        p.esp.proposals = vec![Proposal::new("AES192", "SHA384"), Proposal::new("AES128", "SHA1")];
-        p.network.route_mode = RouteMode::Custom;
-        p.network.mtu = 1300;
-        let s = sparse(&p);
-        assert!(s.contains("gateway = \"vpn.example.com\"") && s.contains("proposals = [\"aes256-sha512\"]"), "{s}");
-        assert!(s.contains("[network]\nroute_mode = \"Custom\"\nmtu = 1300\n"), "keys in Profile order: {s}");
-        assert!(!s.contains("port = 500") && !s.contains("ifname"), "defaults are left out: {s}");
-        let back = parse_profile(&s).unwrap();
-        assert_eq!(Profile { id: p.id.clone(), name: p.name.clone(), ..back }, p);
-    }
-
-    #[test]
-    fn only_changed_keys_and_their_sections_are_written() {
-        let mut p = profile("Office");
-        p.sso.port = 10443;
-        assert_eq!(sparse(&p), "[sso]\nport = 10443\n");
-        p.gateway = "vpn.example.com".into();
-        assert_eq!(sparse(&p), "gateway = \"vpn.example.com\"\n\n[sso]\nport = 10443\n");
-        p.auth.username = "jane".into();
-        p.description = "Office".into();
-        assert_eq!(sparse(&p), "description = \"Office\"\ngateway = \"vpn.example.com\"\n\n[sso]\nport = 10443\n\n[auth]\nusername = \"jane\"\n", "struct order");
-    }
-
-    #[test]
-    fn documented_example_parses() {
-        let s = "description = \"Office\"\ngateway = \"vpn.example.com\"\n\n[sso]\nport = 10443\nverify_cert = false\n\n\
-                 [auth]\nmode = \"Eap\"\nusername = \"jane\"\n\n[ike]\nproposals = [\"aes128-sha1\", \"aes256-sha256\"]\ndh_groups = [20]\n\n\
-                 [network]\nroute_mode = \"Custom\"\ncustom_routes = \"10.0.0.0/8\"\nmtu = 1400\n";
-        let p = parse_profile(s).unwrap();
-        let want = Profile {
-            description: "Office".into(),
-            gateway: "vpn.example.com".into(),
-            sso: Sso { port: 10443, ..Sso::default() },
-            auth: Auth { username: "jane".into(), ..Auth::default() },
-            network: Network { route_mode: RouteMode::Custom, custom_routes: "10.0.0.0/8".into(), ..Network::default() },
-            ..Profile::default()
-        };
-        assert_eq!(Profile { id: want.id.clone(), name: want.name.clone(), ..p }, want);
-    }
-
-    #[test]
-    fn bad_proposal_is_a_parse_error_naming_it() {
-        let err = parse_profile("[esp]\nproposals = [\"aes128-sha1\", \"aes128sha1\"]\n").unwrap_err();
-        assert!(err.contains("\"aes128sha1\""), "{err}");
-        assert!(parse_profile("[ike]\nproposals = [\"-sha1\"]\n").is_err());
-        let err = parse_profile("[ike]\nproposals = [\"foo-bar\"]\n").unwrap_err();
-        assert!(err.contains("\"foo-bar\"") && err.contains("aes128, aes192, aes256") && err.contains("sha1, sha256, sha384, sha512"), "{err}");
-        assert_eq!(parse_profile("[esp]\nproposals = [\"AES256-Sha384\"]\n").unwrap().esp.proposals, [Proposal::new("AES256", "SHA384")]);
-    }
-
-    #[test]
     fn profile_file_has_no_secrets_id_or_name() {
         let mut p = profile("Office");
         p.psk = "topsecret".into();
         p.auth.password = "hunter2".into();
         p.auth.save_password = true;
         assert_eq!(sparse(&p), "[auth]\nsave_password = true\n");
-    }
-
-    #[test]
-    fn unknown_keys_are_ignored() {
-        let p = parse_profile("gateway = \"g\"\nfuture_option = 1\n[sso]\nport = 8443\nfuture_option = 2\n[future_section]\nx = 1\n").unwrap();
-        assert_eq!((p.gateway.as_str(), p.sso.port), ("g", 8443));
-    }
-
-    #[test]
-    fn empty_dirs_load_one_default_profile() {
-        let t = Tmp::new();
-        let c = Config::load_from(&t.paths);
-        assert_eq!(c.profiles.len(), 1);
-        assert_eq!(c.uid.len(), 32);
-        assert!(c.load_errors.is_empty() && c.orphans.is_empty() && c.unreadable.is_empty());
-    }
-
-    #[test]
-    fn save_then_load_keeps_settings_ids_and_selection() {
-        let t = Tmp::new();
-        let mut c = Config::default();
-        c.profiles = vec![profile("B"), profile("A")];
-        c.profiles[0].gateway = "b.example".into();
-        c.selected = 0; // "B"
-        c.show_log = false;
-        c.verbose = true;
-        c.save_to(&t.paths, &Config::default()).unwrap();
-        let l = Config::load_from(&t.paths);
-        assert_eq!(l.profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["A", "B"], "sorted by name");
-        assert_eq!(l.selected, 1, "selection follows the name");
-        assert_eq!(l.profiles[1], c.profiles[0]);
-        assert_eq!(l.profiles[0], c.profiles[1]);
-        assert_eq!((l.uid.as_str(), l.verbose, l.show_log), (c.uid.as_str(), true, false));
     }
 
     #[test]
@@ -726,7 +682,7 @@ mod tests {
         gone.save_to(&t.paths, &c).unwrap();
         assert_eq!(t.files(), ["A.toml", "D.toml"]);
         let l = Config::load_from(&t.paths);
-        assert_eq!(l.profiles.iter().find(|p| p.name == "A").unwrap().id, saved.profiles[1].id, "id follows the profile, not the name");
+        assert_eq!(l.profiles.iter().find(|p| p.name.as_str() == "A").unwrap().id, saved.profiles[1].id, "id follows the profile, not the name");
     }
 
     #[test]
@@ -746,17 +702,6 @@ mod tests {
     }
 
     #[test]
-    fn bad_config_toml_gives_defaults_and_a_message() {
-        let t = Tmp::new();
-        std::fs::create_dir_all(&t.paths.config_dir).unwrap();
-        std::fs::write(t.paths.config_file(), "uid = ").unwrap();
-        let l = Config::load_from(&t.paths);
-        assert_eq!(l.uid.len(), 32);
-        assert_eq!(l.load_errors.len(), 1);
-        assert!(l.load_errors[0].contains("config.toml couldn't be read"), "{}", l.load_errors[0]);
-    }
-
-    #[test]
     fn vanished_and_renamed_files_leave_orphan_ids() {
         let t = Tmp::new();
         let mut c = Config::default();
@@ -768,7 +713,7 @@ mod tests {
         let mut want = vec![c.profiles[0].id.clone(), c.profiles[1].id.clone()];
         want.sort();
         assert_eq!(l.orphans, want);
-        let b2 = l.profiles.iter().find(|p| p.name == "B2").unwrap();
+        let b2 = l.profiles.iter().find(|p| p.name.as_str() == "B2").unwrap();
         assert_ne!(b2.id, c.profiles[1].id, "a hand-renamed file gets a fresh id");
         l.save_to(&t.paths, &l).unwrap();
         assert_eq!(Config::load_from(&t.paths).orphans, want, "orphans persist until the keyring is cleaned");
@@ -807,19 +752,6 @@ mod tests {
     }
 
     #[test]
-    fn save_leaves_unchanged_profile_files_alone() {
-        let t = Tmp::new();
-        let saved = Config { profiles: vec![profile("A"), profile("B")], ..Config::default() };
-        saved.save_to(&t.paths, &saved).unwrap();
-        std::fs::write(t.paths.profile_file("A"), "# hand-written\n").unwrap();
-        let mut c = saved.clone();
-        c.profiles[1].gateway = "b.example".into();
-        c.save_to(&t.paths, &saved).unwrap();
-        assert_eq!(std::fs::read_to_string(t.paths.profile_file("A")).unwrap(), "# hand-written\n");
-        assert_eq!(std::fs::read_to_string(t.paths.profile_file("B")).unwrap(), "gateway = \"b.example\"\n");
-    }
-
-    #[test]
     fn xdg_dir_ignores_empty_and_relative_values() {
         let home = Some(std::ffi::OsString::from("/home/u"));
         let dir = |v: Option<&str>| xdg_dir(v.map(Into::into), home.clone(), ".config");
@@ -830,13 +762,200 @@ mod tests {
     }
 
     #[test]
+    fn dedupe_ids_gives_duplicates_and_empty_ids_a_fresh_id() {
+        let mut c = Config::default();
+        c.profiles.push(c.profiles[0].clone());
+        c.profiles.push(Profile { id: String::new(), ..Profile::default() });
+        let first = c.profiles[0].id.clone();
+        c.dedupe_ids();
+        assert_eq!(c.profiles[0].id, first, "first owner keeps its id");
+        assert_ne!(c.profiles[1].id, first);
+        assert_eq!(c.profiles[2].id.len(), 32);
+        assert_ne!(c.profiles[1].id, c.profiles[2].id);
+    }
+
+    #[test]
+    fn changed_profile_fields_round_trip() {
+        let mut p = profile("Office");
+        p.gateway = Some("vpn.example.com".parse().unwrap());
+        p.sso.port = Port::new(10443).unwrap();
+        p.auth.mode = UserAuth::None;
+        p.ike.proposals = vec!["aes256-sha512".parse().unwrap()];
+        p.ike.dh_groups = vec![DhGroup::Ecp384, DhGroup::Ecp521];
+        p.esp.proposals = vec!["aes192-sha384".parse().unwrap(), "aes128-sha1".parse().unwrap()];
+        p.network.route_mode = RouteMode::Custom;
+        p.network.custom_routes = vec!["10.0.0.0/8".parse().unwrap(), "192.168.10.0/24".parse().unwrap()];
+        p.network.mtu = Mtu::try_from(1300).unwrap();
+        let s = sparse(&p);
+        assert!(s.contains("gateway = \"vpn.example.com\"") && s.contains("proposals = [\"aes256-sha512\"]") && s.contains("dh_groups = [20, 21]"), "{s}");
+        assert!(s.contains("[network]\nroute_mode = \"Custom\"\ncustom_routes = [\"10.0.0.0/8\", \"192.168.10.0/24\"]\nmtu = 1300\n"), "keys in Profile order: {s}");
+        assert!(!s.contains("port = 500") && !s.contains("ifname") && !s.contains("local_id") && !s.contains("username"), "defaults are left out: {s}");
+        let back = parse_profile(&s).unwrap();
+        assert_eq!(Profile { id: p.id.clone(), name: p.name.clone(), ..back }, p);
+    }
+
+    #[test]
+    fn only_changed_keys_and_their_sections_are_written() {
+        let mut p = profile("Office");
+        p.sso.port = Port::new(10443).unwrap();
+        assert_eq!(sparse(&p), "[sso]\nport = 10443\n");
+        p.gateway = Some("vpn.example.com".parse().unwrap());
+        assert_eq!(sparse(&p), "gateway = \"vpn.example.com\"\n\n[sso]\nport = 10443\n");
+        p.auth.username = Some("jane".parse().unwrap());
+        p.description = "Office".into();
+        assert_eq!(sparse(&p), "description = \"Office\"\ngateway = \"vpn.example.com\"\n\n[sso]\nport = 10443\n\n[auth]\nusername = \"jane\"\n", "struct order");
+    }
+
+    #[test]
+    fn documented_example_parses() {
+        let s = "description = \"Office\"\ngateway = \"vpn.example.com\"\n\n[sso]\nport = 10443\nverify_cert = false\n\n\
+                 [auth]\nmode = \"Eap\"\nusername = \"jane\"\n\n[ike]\nproposals = [\"aes128-sha1\", \"aes256-sha256\"]\ndh_groups = [20]\n\n\
+                 [network]\nroute_mode = \"Custom\"\ncustom_routes = [\"10.0.0.0/8\"]\nmtu = 1400\n";
+        let p = parse_profile(s).unwrap();
+        let want = Profile {
+            description: "Office".into(),
+            gateway: Some("vpn.example.com".parse().unwrap()),
+            sso: Sso { port: Port::new(10443).unwrap(), ..Sso::default() },
+            auth: Auth { username: Some("jane".parse().unwrap()), ..Auth::default() },
+            network: Network { route_mode: RouteMode::Custom, custom_routes: vec!["10.0.0.0/8".parse().unwrap()], ..Network::default() },
+            ..Profile::default()
+        };
+        assert_eq!(Profile { id: want.id.clone(), name: want.name.clone(), ..p }, want);
+    }
+
+    #[test]
+    fn old_profile_files_still_load() {
+        // written by the version before typed settings: custom_routes was one string
+        let s = "[ike]\nnatt_keepalive = 20\n\n[sso]\ntimeout = 300\n\n[network]\nroute_mode = \"Custom\"\ncustom_routes = \"10.0.0.0/8, 192.168.10.0/24\"\n";
+        let p = parse_profile(s).unwrap();
+        assert_eq!(p.network.custom_routes, ["10.0.0.0/8".parse::<Ipv4Net>().unwrap(), "192.168.10.0/24".parse().unwrap()]);
+        assert_eq!((p.ike.natt_keepalive.get(), p.sso.timeout.get()), (20, 300));
+        assert!(sparse(&p).contains("custom_routes = [\"10.0.0.0/8\", \"192.168.10.0/24\"]"), "Save writes the array");
+    }
+
+    #[test]
+    fn a_bad_value_makes_the_profile_unreadable_and_says_which() {
+        for (file, field) in [
+            ("[network]\nifname = \"x;y\"\n", "Use 1 to 15 letters"),
+            ("[network]\ncustom_routes = [\"10.1.2.3/16\"]\n", "Did you mean 10.1.0.0/16?"),
+            ("[network]\ncustom_routes = \"10.0.0.0/8, nonsense\"\n", "Line 1: Expected a network"),
+            ("gateway = \"a b\"\n", "Expected a host name"),
+            ("[ike]\nport = 0\n", "Port must be 1 to 65535."),
+            ("[ike]\ndh_groups = [5]\n", "DH group 5"),
+            ("[auth]\nusername = \"jané\"\n", "EAP-MSCHAPv2"),
+            ("[network]\nmtu = 9000\n", "MTU must be 576 to 1500."),
+        ] {
+            let e = parse_profile(file).unwrap_err();
+            assert!(e.contains(field), "{file:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn profile_problems_name_what_is_missing() {
+        let mut p = profile("Office");
+        assert!(p.problems().is_empty());
+        p.ike.proposals.clear();
+        p.ike.dh_groups.clear();
+        p.esp.proposals.clear();
+        p.network.route_mode = RouteMode::Custom;
+        assert_eq!(p.problems(), [NO_P1_PROPOSAL, NO_DH_GROUP, NO_P2_PROPOSAL, NO_ROUTES]);
+    }
+
+    #[test]
+    fn bad_proposal_is_a_parse_error_naming_it() {
+        let err = parse_profile("[esp]\nproposals = [\"aes128-sha1\", \"aes128sha1\"]\n").unwrap_err();
+        assert!(err.contains("\"aes128sha1\""), "{err}");
+        assert!(parse_profile("[ike]\nproposals = [\"-sha1\"]\n").is_err());
+        let err = parse_profile("[ike]\nproposals = [\"foo-bar\"]\n").unwrap_err();
+        assert!(err.contains("\"foo-bar\"") && err.contains("aes128, aes192, aes256") && err.contains("sha1, sha256, sha384, sha512"), "{err}");
+        assert_eq!(parse_profile("[esp]\nproposals = [\"AES256-Sha384\"]\n").unwrap().esp.proposals, ["aes256-sha384".parse::<Proposal>().unwrap()]);
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored() {
+        let p = parse_profile("gateway = \"g\"\nfuture_option = 1\n[sso]\nport = 8443\nfuture_option = 2\n[future_section]\nx = 1\n").unwrap();
+        assert_eq!((p.gateway.unwrap().to_string(), p.sso.port.get()), ("g".to_string(), 8443));
+    }
+
+    #[test]
+    fn empty_dirs_load_one_default_profile() {
+        let t = Tmp::new();
+        let c = Config::load_from(&t.paths);
+        assert_eq!(c.profiles.len(), 1);
+        assert_eq!(c.uid.to_string().len(), 32);
+        assert!(c.load_errors.is_empty() && c.orphans.is_empty() && c.unreadable.is_empty());
+    }
+
+    #[test]
+    fn save_then_load_keeps_settings_ids_and_selection() {
+        let t = Tmp::new();
+        let mut c = Config::default();
+        c.profiles = vec![profile("B"), profile("A")];
+        c.profiles[0].gateway = Some("b.example".parse().unwrap());
+        c.selected = 0; // "B"
+        c.show_log = false;
+        c.verbose = true;
+        c.save_to(&t.paths, &Config::default()).unwrap();
+        let l = Config::load_from(&t.paths);
+        assert_eq!(l.profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["A", "B"], "sorted by name");
+        assert_eq!(l.selected, 1, "selection follows the name");
+        assert_eq!(l.profiles[1], c.profiles[0]);
+        assert_eq!(l.profiles[0], c.profiles[1]);
+        assert_eq!((l.uid, l.verbose, l.show_log), (c.uid, true, false));
+    }
+
+    #[test]
+    fn bad_config_toml_gives_defaults_and_a_message() {
+        let t = Tmp::new();
+        std::fs::create_dir_all(&t.paths.config_dir).unwrap();
+        std::fs::write(t.paths.config_file(), "uid = ").unwrap();
+        let l = Config::load_from(&t.paths);
+        assert_eq!(l.uid.to_string().len(), 32);
+        assert_eq!(l.load_errors.len(), 1);
+        assert!(l.load_errors[0].contains("config.toml couldn't be read"), "{}", l.load_errors[0]);
+    }
+
+    #[test]
+    fn a_malformed_uid_is_reported_not_silently_replaced() {
+        let t = Tmp::new();
+        std::fs::create_dir_all(&t.paths.config_dir).unwrap();
+        std::fs::write(t.paths.config_file(), "uid = \"x&REDIRECT_PORT=1\"\n").unwrap();
+        let l = Config::load_from(&t.paths);
+        assert_eq!(l.load_errors.len(), 1);
+        assert!(l.load_errors[0].contains("The client UID must be 32 hexadecimal characters."), "{}", l.load_errors[0]);
+    }
+
+    #[test]
+    fn profile_file_with_an_unusable_name_is_reported_and_kept() {
+        let t = Tmp::new();
+        std::fs::create_dir_all(t.paths.profiles_dir()).unwrap();
+        std::fs::write(t.paths.profiles_dir().join(".hidden.toml"), "").unwrap();
+        let l = Config::load_from(&t.paths);
+        assert!(l.unreadable.contains_key(".hidden"));
+        assert!(l.load_errors.iter().any(|e| e.contains("Name cannot start with a '.'.")), "{:?}", l.load_errors);
+    }
+
+    #[test]
+    fn save_leaves_unchanged_profile_files_alone() {
+        let t = Tmp::new();
+        let saved = Config { profiles: vec![profile("A"), profile("B")], ..Config::default() };
+        saved.save_to(&t.paths, &saved).unwrap();
+        std::fs::write(t.paths.profile_file("A"), "# hand-written\n").unwrap();
+        let mut c = saved.clone();
+        c.profiles[1].gateway = Some("b.example".parse().unwrap());
+        c.save_to(&t.paths, &saved).unwrap();
+        assert_eq!(std::fs::read_to_string(t.paths.profile_file("A")).unwrap(), "# hand-written\n");
+        assert_eq!(std::fs::read_to_string(t.paths.profile_file("B")).unwrap(), "gateway = \"b.example\"\n");
+    }
+
+    #[test]
     fn duplicate_gets_new_id() {
         let mut p = Profile::default();
         p.name = "Office".into();
         p.psk = "k".into();
         let d = p.duplicate();
         assert_ne!(d.id, p.id);
-        assert_eq!(d.name, "Office (copy)");
+        assert_eq!(d.name.as_str(), "Office (copy)");
         assert_eq!(d.psk, "k");
     }
 
@@ -858,47 +977,107 @@ mod tests {
         assert!(!saved.settings_eq(&typed));
 
         let mut c = a.clone();
-        c.profiles[1].gateway = "vpn.example.com".into();
+        c.profiles[1].gateway = Some("vpn.example.com".parse().unwrap());
         assert!(!a.settings_eq(&c));
     }
 
     #[test]
-    fn dedupe_ids_gives_duplicates_and_empty_ids_a_fresh_id() {
+    fn name_errors_report_clashing_and_unreadable_names() {
         let mut c = Config::default();
-        c.profiles.push(c.profiles[0].clone());
-        c.profiles.push(Profile { id: String::new(), ..Profile::default() });
-        let first = c.profiles[0].id.clone();
-        c.dedupe_ids();
-        assert_eq!(c.profiles[0].id, first, "first owner keeps its id");
-        assert_ne!(c.profiles[1].id, first);
-        assert_eq!(c.profiles[2].id.len(), 32);
-        assert_ne!(c.profiles[1].id, c.profiles[2].id);
-    }
-
-    #[test]
-    fn name_errors_reject_unusable_names() {
-        let long = "x".repeat(101);
-        let mut c = Config::default();
-        c.profiles = ["", "  ", "a/b", ".hidden", long.as_str(), "Office", "Office", "Broken", "fine"].map(profile).to_vec();
+        c.profiles = ["Office", "Office", "Broken", "fine"].map(profile).to_vec();
         c.unreadable.insert("Broken".into(), new_uid());
         let errors = c.name_errors();
-        assert_eq!(errors.len(), 7, "{errors:#?}");
-        assert_eq!(errors[2], "error: connection \"a/b\" can't be saved\n  note: Name cannot contain a '/'.\n  help: choose another name and click Save");
-        assert!(errors[5].contains("Another connection already has this name."));
-        assert!(errors[6].contains("A connection file with this name couldn't be read."));
-        let problems = c.name_problems();
-        assert_eq!((problems[5], problems[6]), (None, Some("Another connection already has this name.")), "the first Office is fine, the second isn't");
-        assert_eq!((problems[2], problems[8]), (Some("Name cannot contain a '/'."), None));
+        assert_eq!(errors.len(), 2, "{errors:#?}");
+        assert_eq!(errors[0], "error: connection \"Office\" can't be saved\n  note: Another connection already has this name.\n  help: choose another name and click Save");
+        assert!(errors[1].contains("A connection file with this name couldn't be read."));
+        assert_eq!(c.name_problems(), [None, Some("Another connection already has this name."), Some("A connection file with this name couldn't be read."), None]);
     }
 
     #[test]
     fn unique_name_appends_the_first_free_number() {
         let mut c = Config::default(); // "New connection"
         c.unreadable.insert("Broken".into(), new_uid());
-        assert_eq!(c.unique_name("Office"), "Office");
-        assert_eq!(c.unique_name("New connection"), "New connection 2");
-        assert_eq!(c.unique_name("Broken"), "Broken 2");
+        assert_eq!(c.unique_name(&"Office".into()).as_str(), "Office");
+        assert_eq!(c.unique_name(&"New connection".into()).as_str(), "New connection 2");
+        assert_eq!(c.unique_name(&"Broken".into()).as_str(), "Broken 2");
         c.profiles.push(profile("New connection 2"));
-        assert_eq!(c.unique_name("New connection"), "New connection 3");
+        assert_eq!(c.unique_name(&"New connection".into()).as_str(), "New connection 3");
+        let long: ProfileName = "x".repeat(100).parse().unwrap();
+        c.profiles.push(Profile { name: long.clone(), ..Profile::default() });
+        assert!(c.unique_name(&long).as_str().ends_with("x 2"), "shortened to fit");
+    }
+
+    #[test]
+    fn padded_username_and_local_id_from_older_files_load() {
+        // older versions wrote what was typed and trimmed it when connecting
+        let p = parse_profile("[auth]\nusername = \"jane \"\n\n[ike]\nlocal_id = \" client.example.com \"\n").unwrap();
+        assert_eq!(p.auth.username.unwrap().to_string(), "jane");
+        assert_eq!(p.ike.local_id.unwrap().to_string(), "client.example.com");
+    }
+
+    #[test]
+    fn lowercase_uid_in_config_toml_is_kept() {
+        let t = Tmp::new();
+        std::fs::create_dir_all(&t.paths.config_dir).unwrap();
+        std::fs::write(t.paths.config_file(), "uid = \"0123456789abcdef0123456789abcdef\"\n").unwrap();
+        let l = Config::load_from(&t.paths);
+        assert!(l.load_errors.is_empty(), "{:?}", l.load_errors);
+        assert_eq!(l.uid.to_string(), "0123456789abcdef0123456789abcdef", "sent as written: same device for the FortiGate");
+    }
+
+    #[test]
+    fn a_huge_bad_line_gives_a_short_message() {
+        let t = Tmp::new();
+        std::fs::create_dir_all(t.paths.profiles_dir()).unwrap();
+        std::fs::write(t.paths.profile_file("big"), format!("description = \"{}\"\n", "a".repeat(5_000_000))).unwrap();
+        std::fs::write(t.paths.profile_file("bigroute"), format!("[network]\ncustom_routes = \"{}\"\n", "1".repeat(1_000_000))).unwrap();
+        let l = Config::load_from(&t.paths);
+        assert_eq!(l.load_errors.len(), 2);
+        for e in &l.load_errors {
+            assert!(e.len() < 2000, "{} bytes", e.len());
+        }
+    }
+
+    #[test]
+    fn empty_strings_from_older_files_mean_not_set() {
+        // older versions wrote a cleared text field as ""
+        let p = parse_profile("gateway = \"\"\n\n[auth]\nusername = \"\"\n\n[ike]\nlocal_id = \"  \"\n").unwrap();
+        assert_eq!((p.gateway, p.auth.username, p.ike.local_id), (None, None, None));
+        let t = Tmp::new();
+        std::fs::create_dir_all(&t.paths.config_dir).unwrap();
+        std::fs::write(t.paths.config_file(), "uid = \"\"\n").unwrap();
+        let l = Config::load_from(&t.paths);
+        assert!(l.load_errors.is_empty(), "{:?}", l.load_errors);
+        assert_eq!(l.uid.to_string().len(), 32, "an empty uid gets a new one, as before");
+    }
+
+    #[test]
+    fn files_in_an_older_format_are_rewritten_by_the_next_save() {
+        let t = Tmp::new();
+        std::fs::create_dir_all(t.paths.profiles_dir()).unwrap();
+        // what the version before typed settings wrote
+        std::fs::write(t.paths.profile_file("Old"), "gateway = \"vpn.example.com\"\n\n[auth]\nusername = \"\"\n\n[network]\ncustom_routes = \"\"\n").unwrap();
+        // current format, with a hand-written comment: left alone
+        std::fs::write(t.paths.profile_file("Current"), "# mine\ngateway = \"vpn.example.com\"\n").unwrap();
+        let l = Config::load_from(&t.paths);
+        assert!(l.load_errors.is_empty(), "{:?}", l.load_errors);
+        let old = l.profiles.iter().find(|p| p.name.as_str() == "Old").unwrap();
+        assert_eq!(l.outdated.iter().collect::<Vec<_>>(), [&old.id]);
+        l.save_to(&t.paths, &l).unwrap();
+        assert_eq!(std::fs::read_to_string(t.paths.profile_file("Old")).unwrap(), "gateway = \"vpn.example.com\"\n");
+        assert_eq!(std::fs::read_to_string(t.paths.profile_file("Current")).unwrap(), "# mine\ngateway = \"vpn.example.com\"\n");
+        assert!(Config::load_from(&t.paths).outdated.is_empty());
+    }
+
+    #[test]
+    fn an_old_log_file_setting_is_ignored() {
+        // the log-file option is gone; a config.toml that still has it loads, and the next Save drops the key
+        let t = Tmp::new();
+        std::fs::create_dir_all(&t.paths.config_dir).unwrap();
+        std::fs::write(t.paths.config_file(), "uid = \"0123456789ABCDEF0123456789ABCDEF\"\nlog_file = \"~/fortisaml.log\"\n").unwrap();
+        let l = Config::load_from(&t.paths);
+        assert!(l.load_errors.is_empty(), "{:?}", l.load_errors);
+        l.save_to(&t.paths, &l).unwrap();
+        assert_eq!(std::fs::read_to_string(t.paths.config_file()).unwrap(), "uid = \"0123456789ABCDEF0123456789ABCDEF\"\n");
     }
 }

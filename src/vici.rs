@@ -19,55 +19,159 @@ const EVENT: u8 = 7;
 /// charon refuses bigger messages; also bounds what a broken peer can make us allocate
 const MAX_PACKET: usize = 512 * 1024;
 
-#[derive(Debug, PartialEq)]
-pub struct Packet {
-    pub kind: u8,
-    pub name: Option<String>,
-    pub body: Vec<u8>,
+/// Commands we send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cmd {
+    Version,
+    Stats,
+    LoadConn,
+    LoadShared,
+    Initiate,
+    Terminate,
+    ListSas,
 }
 
-fn named(kind: u8) -> bool {
-    matches!(kind, CMD_REQUEST | EVENT_REGISTER | EVENT_UNREGISTER | EVENT)
-}
-
-pub fn encode(kind: u8, name: Option<&str>, body: &[u8]) -> Vec<u8> {
-    let mut p = vec![kind];
-    if let Some(n) = name {
-        p.push(n.len() as u8);
-        p.extend_from_slice(n.as_bytes());
+impl Cmd {
+    const ALL: [Cmd; 7] = [Cmd::Version, Cmd::Stats, Cmd::LoadConn, Cmd::LoadShared, Cmd::Initiate, Cmd::Terminate, Cmd::ListSas];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Cmd::Version => "version",
+            Cmd::Stats => "stats",
+            Cmd::LoadConn => "load-conn",
+            Cmd::LoadShared => "load-shared",
+            Cmd::Initiate => "initiate",
+            Cmd::Terminate => "terminate",
+            Cmd::ListSas => "list-sas",
+        }
     }
-    p.extend_from_slice(body);
-    let mut out = (p.len() as u32).to_be_bytes().to_vec();
-    out.extend(p);
+}
+
+impl std::str::FromStr for Cmd {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        Self::ALL.into_iter().find(|c| c.as_str() == s).ok_or_else(|| format!("unknown VICI command {s:?}"))
+    }
+}
+
+/// Events we subscribe to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventName {
+    ControlLog,
+    ListSa,
+    IkeUpdown,
+}
+
+impl EventName {
+    const ALL: [EventName; 3] = [EventName::ControlLog, EventName::ListSa, EventName::IkeUpdown];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventName::ControlLog => "control-log",
+            EventName::ListSa => "list-sa",
+            EventName::IkeUpdown => "ike-updown",
+        }
+    }
+}
+
+impl std::str::FromStr for EventName {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        Self::ALL.into_iter().find(|e| e.as_str() == s).ok_or_else(|| format!("unknown VICI event {s:?}"))
+    }
+}
+
+/// One VICI packet. Named types carry a `Cmd`/`EventName`, unnamed ones can't have a name.
+#[derive(Debug, PartialEq)]
+pub enum Packet {
+    CmdRequest { cmd: Cmd, body: Vec<u8> },
+    CmdResponse(Vec<u8>),
+    CmdUnknown,
+    EventRegister(EventName),
+    EventUnregister(EventName),
+    EventConfirm,
+    EventUnknown,
+    Event { name: EventName, body: Vec<u8> },
+}
+
+impl Packet {
+    /// The command or event name of a named packet type.
+    pub fn name(&self) -> Option<&'static str> {
+        match self {
+            Packet::CmdRequest { cmd, .. } => Some(cmd.as_str()),
+            Packet::EventRegister(e) | Packet::EventUnregister(e) | Packet::Event { name: e, .. } => Some(e.as_str()),
+            _ => None,
+        }
+    }
+}
+
+pub fn encode(p: &Packet) -> Vec<u8> {
+    let (kind, body): (u8, &[u8]) = match p {
+        Packet::CmdRequest { body, .. } => (CMD_REQUEST, body),
+        Packet::CmdResponse(body) => (CMD_RESPONSE, body),
+        Packet::CmdUnknown => (CMD_UNKNOWN, &[]),
+        Packet::EventRegister(_) => (EVENT_REGISTER, &[]),
+        Packet::EventUnregister(_) => (EVENT_UNREGISTER, &[]),
+        Packet::EventConfirm => (EVENT_CONFIRM, &[]),
+        Packet::EventUnknown => (EVENT_UNKNOWN, &[]),
+        Packet::Event { body, .. } => (EVENT, body),
+    };
+    let mut payload = vec![kind];
+    if let Some(n) = p.name() {
+        // one of the short names above, so its length fits the byte
+        payload.push(n.len() as u8);
+        payload.extend_from_slice(n.as_bytes());
+    }
+    payload.extend_from_slice(body);
+    let mut out = (payload.len() as u32).to_be_bytes().to_vec();
+    out.extend(payload);
     out
 }
 
-pub fn decode(payload: &[u8]) -> Result<Packet, String> {
+/// The packet in `payload` (without the length prefix). `Ok(None)`: an event whose name we don't know.
+pub fn decode(payload: &[u8]) -> Result<Option<Packet>, String> {
     let (&kind, rest) = payload.split_first().ok_or("empty VICI packet")?;
-    if !named(kind) {
-        return Ok(Packet { kind, name: None, body: rest.to_vec() });
-    }
-    let (&len, rest) = rest.split_first().ok_or("truncated VICI packet")?;
-    let len = len as usize;
-    if rest.len() < len {
-        return Err("truncated VICI packet name".into());
-    }
-    let name = String::from_utf8(rest[..len].to_vec()).map_err(|_| "VICI packet name isn't UTF-8")?;
-    Ok(Packet { kind, name: Some(name), body: rest[len..].to_vec() })
+    let named = |rest: &[u8]| -> Result<(String, Vec<u8>), String> {
+        let (&len, rest) = rest.split_first().ok_or("truncated VICI packet")?;
+        let len = len as usize;
+        if rest.len() < len {
+            return Err("truncated VICI packet name".into());
+        }
+        let name = String::from_utf8(rest[..len].to_vec()).map_err(|_| "VICI packet name isn't UTF-8")?;
+        Ok((name, rest[len..].to_vec()))
+    };
+    Ok(Some(match kind {
+        CMD_REQUEST => {
+            let (n, body) = named(rest)?;
+            Packet::CmdRequest { cmd: n.parse()?, body }
+        }
+        CMD_RESPONSE => Packet::CmdResponse(rest.to_vec()),
+        CMD_UNKNOWN => Packet::CmdUnknown,
+        EVENT_REGISTER => Packet::EventRegister(named(rest)?.0.parse()?),
+        EVENT_UNREGISTER => Packet::EventUnregister(named(rest)?.0.parse()?),
+        EVENT_CONFIRM => Packet::EventConfirm,
+        EVENT_UNKNOWN => Packet::EventUnknown,
+        EVENT => {
+            let (n, body) = named(rest)?;
+            match n.parse() {
+                Ok(name) => Packet::Event { name, body },
+                Err(_) => return Ok(None),
+            }
+        }
+        k => return Err(format!("unknown VICI packet type {k}")),
+    }))
 }
 
 /// The usual command result: `success = yes|no`, `errmsg` on failure.
 #[derive(Deserialize, Debug, Default)]
 pub struct Status {
     #[serde(default)]
-    pub success: String,
+    pub success: bool,
     #[serde(default)]
     pub errmsg: String,
 }
 
 impl Status {
     pub fn check(self, what: &str) -> Result<(), String> {
-        if self.success == "yes" { Ok(()) } else { Err(format!("{what} failed: {}", if self.errmsg.is_empty() { "no reason given" } else { &self.errmsg })) }
+        if self.success { Ok(()) } else { Err(format!("{what} failed: {}", if self.errmsg.is_empty() { "no reason given" } else { &self.errmsg })) }
     }
 }
 
@@ -90,40 +194,44 @@ impl Vici {
         Self { stream }
     }
 
-    fn send(&mut self, kind: u8, name: Option<&str>, body: &[u8]) -> Result<(), String> {
-        self.stream.write_all(&encode(kind, name, body)).map_err(|e| format!("VICI write: {e}"))
+    fn send(&mut self, p: &Packet) -> Result<(), String> {
+        self.stream.write_all(&encode(p)).map_err(|e| format!("VICI write: {e}"))
     }
 
-    /// Next packet; `Ok(None)` when `timeout` passes without one.
+    /// Next packet; `Ok(None)` when `timeout` passes without one. Events we don't know are skipped.
     pub fn recv(&mut self, timeout: Option<Duration>) -> Result<Option<Packet>, String> {
-        self.stream.set_read_timeout(timeout).map_err(|e| e.to_string())?;
-        let mut len = [0u8; 4];
-        match self.stream.read_exact(&mut len) {
-            Ok(()) => {}
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err("charon closed the VICI connection".into()),
-            Err(e) => return Err(format!("VICI read: {e}")),
+        loop {
+            self.stream.set_read_timeout(timeout).map_err(|e| e.to_string())?;
+            let mut len = [0u8; 4];
+            match self.stream.read_exact(&mut len) {
+                Ok(()) => {}
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err("charon closed the VICI connection".into()),
+                Err(e) => return Err(format!("VICI read: {e}")),
+            }
+            let len = u32::from_be_bytes(len) as usize;
+            if len == 0 || len > MAX_PACKET {
+                return Err(format!("bad VICI packet length {len}"));
+            }
+            let mut payload = vec![0u8; len];
+            self.stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+            self.stream.read_exact(&mut payload).map_err(|e| format!("VICI read: {e}"))?;
+            if let Some(p) = decode(&payload)? {
+                return Ok(Some(p));
+            }
         }
-        let len = u32::from_be_bytes(len) as usize;
-        if len == 0 || len > MAX_PACKET {
-            return Err(format!("bad VICI packet length {len}"));
-        }
-        let mut payload = vec![0u8; len];
-        self.stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
-        self.stream.read_exact(&mut payload).map_err(|e| format!("VICI read: {e}"))?;
-        decode(&payload).map(Some)
     }
 
-    /// Subscribe to event `name` (e.g. "ike-updown", "child-updown", "control-log").
-    pub fn register(&mut self, name: &str) -> Result<(), String> {
-        self.send(EVENT_REGISTER, Some(name), &[])?;
+    /// Subscribe to event `ev`.
+    pub fn register(&mut self, ev: EventName) -> Result<(), String> {
+        self.send(&Packet::EventRegister(ev))?;
         loop {
             match self.recv(Some(Duration::from_secs(5)))? {
-                Some(p) if p.kind == EVENT_CONFIRM => return Ok(()),
-                Some(p) if p.kind == EVENT_UNKNOWN => return Err(format!("charon doesn't know event {name}")),
-                Some(p) if p.kind == EVENT => continue, // an earlier subscription
-                Some(p) => return Err(format!("unexpected VICI packet type {} while registering {name}", p.kind)),
-                None => return Err(format!("no answer from charon registering {name}")),
+                Some(Packet::EventConfirm) => return Ok(()),
+                Some(Packet::EventUnknown) => return Err(format!("charon doesn't know event {}", ev.as_str())),
+                Some(Packet::Event { .. }) => continue, // an earlier subscription
+                Some(_) => return Err(format!("unexpected VICI packet while registering {}", ev.as_str())),
+                None => return Err(format!("no answer from charon registering {}", ev.as_str())),
             }
         }
     }
@@ -131,31 +239,30 @@ impl Vici {
     /// Run command `cmd`; events that arrive meanwhile go to `on_event(name, body)`.
     pub fn request<Q: Serialize, A: DeserializeOwned>(
         &mut self,
-        cmd: &str,
+        cmd: Cmd,
         req: &Q,
         timeout: Duration,
-        on_event: &mut dyn FnMut(&str, &[u8]),
+        on_event: &mut dyn FnMut(EventName, &[u8]),
     ) -> Result<A, String> {
-        let body = serde_vici::to_vec(req).map_err(|e| format!("VICI encode {cmd}: {e}"))?;
-        self.send(CMD_REQUEST, Some(cmd), &body)?;
+        let name = cmd.as_str();
+        let body = serde_vici::to_vec(req).map_err(|e| format!("VICI encode {name}: {e}"))?;
+        self.send(&Packet::CmdRequest { cmd, body })?;
         loop {
             match self.recv(Some(timeout))? {
-                Some(Packet { kind: CMD_RESPONSE, body, .. }) => {
-                    return serde_vici::from_slice(&body).map_err(|e| format!("VICI decode {cmd}: {e}"));
-                }
-                Some(Packet { kind: CMD_UNKNOWN, .. }) => return Err(format!("charon doesn't know command {cmd}")),
-                Some(Packet { kind: EVENT, name: Some(n), body }) => on_event(&n, &body),
-                Some(p) => return Err(format!("unexpected VICI packet type {} for {cmd}", p.kind)),
-                None => return Err(format!("no answer from charon for {cmd} within {}s", timeout.as_secs())),
+                Some(Packet::CmdResponse(body)) => return serde_vici::from_slice(&body).map_err(|e| format!("VICI decode {name}: {e}")),
+                Some(Packet::CmdUnknown) => return Err(format!("charon doesn't know command {name}")),
+                Some(Packet::Event { name: ev, body }) => on_event(ev, &body),
+                Some(_) => return Err(format!("unexpected VICI packet for {name}")),
+                None => return Err(format!("no answer from charon for {name} within {}s", timeout.as_secs())),
             }
         }
     }
 
-    /// Next event within `timeout`: (name, body).
-    pub fn next_event(&mut self, timeout: Duration) -> Result<Option<(String, Vec<u8>)>, String> {
+    /// Next event within `timeout`.
+    pub fn next_event(&mut self, timeout: Duration) -> Result<Option<(EventName, Vec<u8>)>, String> {
         match self.recv(Some(timeout))? {
-            Some(Packet { kind: EVENT, name: Some(n), body }) => Ok(Some((n, body))),
-            Some(p) => Err(format!("unexpected VICI packet type {} between events", p.kind)),
+            Some(Packet::Event { name, body }) => Ok(Some((name, body))),
+            Some(_) => Err("unexpected VICI packet between events".into()),
             None => Ok(None),
         }
     }
@@ -168,13 +275,34 @@ mod tests {
 
     #[test]
     fn packets_encode_and_decode() {
-        let p = encode(CMD_REQUEST, Some("version"), &[]);
+        let p = encode(&Packet::CmdRequest { cmd: Cmd::Version, body: vec![] });
         assert_eq!(p, [0, 0, 0, 9, 0, 7, b'v', b'e', b'r', b's', b'i', b'o', b'n']);
-        assert_eq!(decode(&p[4..]).unwrap(), Packet { kind: CMD_REQUEST, name: Some("version".into()), body: vec![] });
-        let r = encode(CMD_RESPONSE, None, &[3, 1, b'k', 0, 1, b'v']);
-        assert_eq!(decode(&r[4..]).unwrap(), Packet { kind: CMD_RESPONSE, name: None, body: vec![3, 1, b'k', 0, 1, b'v'] });
+        assert_eq!(decode(&p[4..]).unwrap(), Some(Packet::CmdRequest { cmd: Cmd::Version, body: vec![] }));
+        let r = encode(&Packet::CmdResponse(vec![3, 1, b'k', 0, 1, b'v']));
+        assert_eq!(decode(&r[4..]).unwrap(), Some(Packet::CmdResponse(vec![3, 1, b'k', 0, 1, b'v'])));
         assert!(decode(&[EVENT, 9, b'x']).is_err(), "name longer than the packet");
         assert!(decode(&[]).is_err());
+        assert!(decode(&[42]).is_err(), "unknown packet type");
+        assert_eq!(decode(&[EVENT, 3, b'f', b'o', b'o']).unwrap(), None, "events we don't know are skipped");
+        assert!(decode(&[CMD_REQUEST, 3, b'f', b'o', b'o']).is_err(), "commands we don't know aren't");
+    }
+
+    #[test]
+    fn every_packet_round_trips() {
+        for p in [
+            Packet::CmdRequest { cmd: Cmd::Initiate, body: vec![1, 2] },
+            Packet::CmdResponse(vec![3]),
+            Packet::CmdUnknown,
+            Packet::EventRegister(EventName::IkeUpdown),
+            Packet::EventUnregister(EventName::ControlLog),
+            Packet::EventConfirm,
+            Packet::EventUnknown,
+            Packet::Event { name: EventName::ListSa, body: vec![4] },
+        ] {
+            let bytes = encode(&p);
+            assert_eq!(u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize, bytes.len() - 4);
+            assert_eq!(decode(&bytes[4..]).unwrap(), Some(p));
+        }
     }
 
     #[test]
@@ -185,7 +313,7 @@ mod tests {
         assert_eq!(serde_vici::to_vec(&m).unwrap(), [3, 4, b'k', b'e', b'y', b'1', 0, 6, b'v', b'a', b'l', b'u', b'e', b'1']);
     }
 
-    /// A fake charon on the other end of a socket pair: answers `version`, forwards one event first.
+    /// A fake charon on the other end of a socket pair: answers `initiate`, forwards one event first.
     #[test]
     fn request_collects_events_then_returns_the_response() {
         let (a, mut b) = UnixStream::pair().unwrap();
@@ -194,20 +322,18 @@ mod tests {
             b.read_exact(&mut len).unwrap();
             let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
             b.read_exact(&mut req).unwrap();
-            assert_eq!(decode(&req).unwrap().name.as_deref(), Some("initiate"));
-            let mut log = BTreeMap::new();
-            log.insert("msg", "establishing CHILD_SA");
-            b.write_all(&encode(EVENT, Some("control-log"), &serde_vici::to_vec(&log).unwrap())).unwrap();
-            let mut ok = BTreeMap::new();
-            ok.insert("success", "yes");
-            b.write_all(&encode(CMD_RESPONSE, None, &serde_vici::to_vec(&ok).unwrap())).unwrap();
+            assert_eq!(decode(&req).unwrap().unwrap().name(), Some("initiate"));
+            let log = BTreeMap::from([("msg", "establishing CHILD_SA")]);
+            b.write_all(&encode(&Packet::Event { name: EventName::ControlLog, body: serde_vici::to_vec(&log).unwrap() })).unwrap();
+            let ok = BTreeMap::from([("success", "yes")]);
+            b.write_all(&encode(&Packet::CmdResponse(serde_vici::to_vec(&ok).unwrap()))).unwrap();
         });
         let mut v = Vici::from_stream(a);
         let mut seen = vec![];
         let st: Status = v
-            .request("initiate", &Empty {}, Duration::from_secs(5), &mut |n, body| {
+            .request(Cmd::Initiate, &Empty {}, Duration::from_secs(5), &mut |n, body| {
                 let m: BTreeMap<String, String> = serde_vici::from_slice(body).unwrap();
-                seen.push(format!("{n}: {}", m["msg"]));
+                seen.push(format!("{}: {}", n.as_str(), m["msg"]));
             })
             .unwrap();
         server.join().unwrap();
@@ -225,8 +351,13 @@ mod tests {
     }
 
     #[test]
-    fn failed_status_has_a_reason() {
-        let s = Status { success: "no".into(), errmsg: "unknown peer".into() };
+    fn status_reads_yes_no_and_a_missing_value() {
+        let body = |m: BTreeMap<&str, &str>| serde_vici::to_vec(&m).unwrap();
+        let s: Status = serde_vici::from_slice(&body(BTreeMap::from([("success", "yes")]))).unwrap();
+        assert!(s.success);
+        let s: Status = serde_vici::from_slice(&body(BTreeMap::from([("success", "no"), ("errmsg", "unknown peer")]))).unwrap();
         assert_eq!(s.check("load-conn").unwrap_err(), "load-conn failed: unknown peer");
+        let s: Status = serde_vici::from_slice(&body(BTreeMap::from([("errmsg", "x")]))).unwrap();
+        assert!(!s.success, "no success key counts as failed");
     }
 }

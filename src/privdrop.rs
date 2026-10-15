@@ -3,14 +3,23 @@
 //! through exec. Capabilities and NO_NEW_PRIVS are per thread: the drop applies to the calling (main) thread, which
 //! does all the privileged work; the other threads only read pipes.
 
-/// `PKEXEC_UID` as set by pkexec for the program it runs.
-pub fn pkexec_uid() -> Result<u32, String> {
-    let v = std::env::var("PKEXEC_UID").map_err(|_| "PKEXEC_UID is not set (not started through pkexec)".to_string())?;
-    let uid: u32 = v.parse().map_err(|_| format!("bad PKEXEC_UID {v:?}"))?;
-    if uid == 0 {
-        return Err("PKEXEC_UID is 0: refusing to keep running as root".into());
+/// A uid that isn't root: the only kind `drop_to` accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NonRootUid(u32);
+
+impl NonRootUid {
+    pub fn new(uid: u32) -> Result<Self, String> {
+        if uid == 0 { Err("PKEXEC_UID is 0: refusing to keep running as root".into()) } else { Ok(Self(uid)) }
     }
-    Ok(uid)
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// `PKEXEC_UID` as set by pkexec for the program it runs.
+pub fn pkexec_uid() -> Result<NonRootUid, String> {
+    let v = std::env::var("PKEXEC_UID").map_err(|_| "PKEXEC_UID is not set (not started through pkexec)".to_string())?;
+    NonRootUid::new(v.parse().map_err(|_| format!("bad PKEXEC_UID {v:?}"))?)
 }
 
 const CAP_KILL: u32 = 5;
@@ -34,7 +43,8 @@ struct CapData {
 }
 
 /// Switch to `uid` and its primary group, keeping only `KEPT_CAPS`. Must be called while still root.
-pub fn drop_to(uid: u32) -> Result<(), String> {
+pub fn drop_to(uid: NonRootUid) -> Result<(), String> {
+    let uid = uid.get();
     let err = |what: &str| format!("dropping privileges: {what}: {}", std::io::Error::last_os_error());
     // SAFETY: plain libc calls on our own process; getpwuid_r writes only into the buffers we pass
     unsafe {
@@ -88,12 +98,18 @@ mod tests {
     fn pkexec_uid_rules() {
         // SAFETY: test-only env changes; these tests don't run in parallel with others reading PKEXEC_UID
         unsafe { std::env::set_var("PKEXEC_UID", "1000") };
-        assert_eq!(pkexec_uid(), Ok(1000));
+        assert_eq!(pkexec_uid().map(NonRootUid::get), Ok(1000));
         unsafe { std::env::set_var("PKEXEC_UID", "0") };
         assert!(pkexec_uid().is_err());
         unsafe { std::env::set_var("PKEXEC_UID", "x") };
         assert!(pkexec_uid().is_err());
         unsafe { std::env::remove_var("PKEXEC_UID") };
         assert!(pkexec_uid().is_err());
+    }
+
+    #[test]
+    fn root_is_not_a_uid_to_drop_to() {
+        assert_eq!(NonRootUid::new(0).unwrap_err(), "PKEXEC_UID is 0: refusing to keep running as root");
+        assert_eq!(NonRootUid::new(1000).map(NonRootUid::get), Ok(1000));
     }
 }

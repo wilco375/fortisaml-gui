@@ -3,7 +3,8 @@
 
 use crate::charon::Established;
 use crate::net::{IfName, Ipv4Net, Mtu};
-use crate::{netlink, resolved};
+use crate::netlink::{self, IfIndex};
+use crate::resolved;
 
 pub struct TunnelOpts {
     pub ifname: IfName,
@@ -16,19 +17,17 @@ pub struct TunnelOpts {
 
 #[derive(Debug, PartialEq)]
 enum Undo {
-    Link(u32),
+    Link(IfIndex),
     Route(Ipv4Net),
     Ipv6Block,
 }
 
 pub struct Tunnel {
     undo: Vec<Undo>,
-    pub index: u32,
+    pub index: IfIndex,
     pub routes: Vec<Ipv4Net>,
     pub full: bool,
 }
-
-const HALVES: [&str; 2] = ["0.0.0.0/1", "128.0.0.0/1"];
 
 impl Tunnel {
     /// Create the xfrm interface. Done before the IKE negotiation, so charon can hand the VPN's DNS servers to
@@ -41,7 +40,7 @@ impl Tunnel {
 
     /// Bring the interface up with what the gateway assigned. On error the caller runs `down`.
     pub fn configure(&mut self, est: &Established, o: &TunnelOpts, log: &dyn Fn(String)) -> Result<(), String> {
-        netlink::link_up(self.index, o.mtu.into())?;
+        netlink::link_up(self.index, o.mtu)?;
         netlink::add_addr(self.index, est.vip)?;
         let mut routes = o.routes.clone().unwrap_or_else(|| est.remote_ts.clone());
         self.full = routes.iter().any(|r| r.prefix() == 0);
@@ -54,7 +53,7 @@ impl Tunnel {
             } else {
                 log(format!("using the existing route to the gateway {}", est.gateway));
             }
-            routes = HALVES.iter().map(|h| h.parse().expect("valid network")).collect();
+            routes = Ipv4Net::HALVES.to_vec();
             if o.block_ipv6 {
                 netlink::add_ipv6_block()?;
                 self.undo.push(Undo::Ipv6Block);
@@ -70,7 +69,7 @@ impl Tunnel {
         self.routes = routes;
         if o.set_dns && self.full {
             // a DNS failure leaves a working tunnel: warn, don't fail
-            if let Err(e) = resolved::route_all_queries(self.index) {
+            if let Err(e) = resolved::route_all_queries(self.index.get()) {
                 log(format!("WARNING: DNS queries not routed through the VPN: {e}"));
             }
         }
@@ -137,7 +136,7 @@ mod tests {
         let mut t = Tunnel::create(&opts(None), &quiet).unwrap();
         t.configure(&est(&["0.0.0.0/0"]), &opts(None), &quiet).unwrap();
         assert!(t.full);
-        assert_eq!(t.routes, HALVES.map(|h| h.parse::<Ipv4Net>().unwrap()));
+        assert_eq!(t.routes, Ipv4Net::HALVES);
         assert_eq!(netlink::route_to(Ipv4Addr::new(198, 51, 100, 7)).unwrap(), (Some(Ipv4Addr::new(192, 0, 2, 1)), ui), "gateway stays outside");
         assert_eq!(netlink::route_to(Ipv4Addr::new(203, 0, 113, 9)).unwrap().1, t.index, "everything else goes in");
         t.down(&quiet);

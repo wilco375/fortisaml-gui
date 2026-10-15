@@ -223,13 +223,23 @@ fn connect(host: &str, port: u16) -> Result<TcpStream, String> {
 
 /// HTTPS POST; returns (status line + headers, body).
 pub fn https_post(host: &str, port: u16, path: &str, headers: &[(&str, &str)], body: &[u8], verify: bool, log: Log) -> Result<(String, Vec<u8>), String> {
+    https_request("POST", host, port, path, headers, body, verify, log)
+}
+
+/// HTTPS GET; returns (status line + headers, body). Redirects aren't followed.
+pub fn https_get(host: &str, port: u16, path: &str, headers: &[(&str, &str)], verify: bool, log: Log) -> Result<(String, Vec<u8>), String> {
+    https_request("GET", host, port, path, headers, &[], verify, log)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn https_request(method: &str, host: &str, port: u16, path: &str, headers: &[(&str, &str)], body: &[u8], verify: bool, log: Log) -> Result<(String, Vec<u8>), String> {
     let cfg = client_config(verify, log)?;
     let name = ServerName::try_from(host.to_string()).map_err(|e| format!("bad server name {host}: {e}"))?;
     let mut conn = rustls::ClientConnection::new(cfg, name).map_err(|e| e.to_string())?;
     let mut sock = connect(host, port)?;
     sock.set_read_timeout(Some(Duration::from_secs(15))).ok();
     let mut tls = rustls::Stream::new(&mut conn, &mut sock);
-    let mut req = format!("POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());
     for (k, v) in headers {
         req += &format!("{k}: {v}\r\n");
     }
@@ -244,3 +254,4 @@ pub fn https_post(host: &str, port: u16, path: &str, headers: &[(&str, &str)], b
     }
     split_http(&buf)
 }
+

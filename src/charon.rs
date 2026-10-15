@@ -2,9 +2,11 @@
 //! IKE ports, no routes or addresses of its own (we do those on our xfrm interface), and a plugin allowlist.
 //! Secrets never go into the config file; they're loaded over VICI.
 
-use crate::net::{Host, IfName, Ipv4Net, Secret};
+use crate::net::{self, DhGroup, Host, IfName, Ipv4Net, LocalId, Port, Proposal, Secret};
 use crate::netlink::IF_ID;
-use crate::vici::{Empty, Status, Vici};
+use crate::protocol::ClientAuth;
+use crate::vici::{Cmd, Empty, EventName, Status, Vici};
+use vec1::Vec1;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -106,6 +108,10 @@ pub fn config(keepalive_s: u32, verbose: bool, dns_name: Option<&str>) -> String
     filelog {{
         stderr {{
             default = {level}
+            # fd watcher, SA checkout/checkin and job queue: noise even when verbose
+            wch = 1
+            mgr = 1
+            job = 1
             ike_name = yes
         }}
     }}
@@ -195,7 +201,7 @@ struct Stats {
 
 /// Check that the plugins we need are loaded (`resolve` too when VPN DNS is wanted).
 pub fn check_plugins(v: &mut Vici, dns: bool) -> Result<(), String> {
-    let s: Stats = v.request("stats", &Empty {}, Duration::from_secs(5), &mut |_, _| {})?;
+    let s: Stats = v.request(Cmd::Stats, &Empty {}, Duration::from_secs(5), &mut |_, _| {})?;
     let needed = REQUIRED.into_iter().chain(dns.then_some("resolve"));
     let missing: Vec<&str> = needed.filter(|p| !s.plugins.iter().any(|l| l == p)).collect();
     if missing.is_empty() {
@@ -208,30 +214,28 @@ pub fn check_plugins(v: &mut Vici, dns: bool) -> Result<(), String> {
     }
 }
 
-/// How the client authenticates.
-#[derive(Clone, Debug)]
-pub enum ClientAuth {
-    /// EAP with this identity and secret (SSO: FortiClient UID + SAML token; otherwise username + password)
-    Eap { identity: String, secret: Secret },
-    /// pre-shared key only, no user authentication
-    PskOnly,
-}
-
 #[derive(Clone, Debug)]
 pub struct ConnParams {
     pub gateway: Host,
-    pub ike_port: u16,
-    /// strongSwan proposal strings, e.g. "aes128-sha1-ecp384"
-    pub ike_proposals: Vec<String>,
-    pub esp_proposals: Vec<String>,
-    pub local_id: Option<String>,
+    pub ike_port: Port,
+    pub ike_proposals: Vec1<Proposal>,
+    pub dh_groups: Vec1<DhGroup>,
+    pub esp_proposals: Vec1<Proposal>,
+    pub local_id: Option<LocalId>,
     pub auth: ClientAuth,
     pub psk: Secret,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AuthMethod {
+    Eap,
+    Psk,
+}
+
+#[derive(Serialize)]
 struct AuthSection {
-    auth: String,
+    auth: AuthMethod,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,7 +244,7 @@ struct AuthSection {
 
 #[derive(Serialize)]
 struct ChildSection {
-    remote_ts: Vec<String>,
+    remote_ts: Vec<Ipv4Net>,
     esp_proposals: Vec<String>,
     if_id_in: String,
     if_id_out: String,
@@ -248,14 +252,15 @@ struct ChildSection {
 
 #[derive(Serialize)]
 struct ConnSection {
-    version: String,
-    remote_addrs: Vec<String>,
-    remote_port: String,
-    encap: String,
-    vips: Vec<String>,
+    version: u8,
+    remote_addrs: Vec<Host>,
+    remote_port: Port,
+    encap: bool,
+    vips: Vec<Ipv4Addr>,
     proposals: Vec<String>,
-    keyingtries: String,
-    dpd_delay: String,
+    keyingtries: u32,
+    /// seconds
+    dpd_delay: u32,
     local: AuthSection,
     remote: AuthSection,
     children: BTreeMap<String, ChildSection>,
@@ -264,36 +269,44 @@ struct ConnSection {
 /// The `load-conn` message for `p`.
 pub fn conn_message(p: &ConnParams) -> BTreeMap<String, impl Serialize> {
     let local = match &p.auth {
-        ClientAuth::Eap { identity, .. } => AuthSection { auth: "eap".into(), id: p.local_id.clone(), eap_id: Some(identity.clone()) },
-        ClientAuth::PskOnly => AuthSection { auth: "psk".into(), id: p.local_id.clone(), eap_id: None },
+        ClientAuth::Eap { identity, .. } => AuthSection { auth: AuthMethod::Eap, id: p.local_id.as_ref().map(ToString::to_string), eap_id: Some(identity.to_string()) },
+        ClientAuth::PskOnly => AuthSection { auth: AuthMethod::Psk, id: p.local_id.as_ref().map(ToString::to_string), eap_id: None },
     };
     let child = ChildSection {
-        remote_ts: vec!["0.0.0.0/0".into()],
-        esp_proposals: p.esp_proposals.clone(),
+        remote_ts: vec![Ipv4Net::ALL],
+        esp_proposals: net::esp_proposals(&p.esp_proposals),
         if_id_in: format!("{IF_ID:#x}"),
         if_id_out: format!("{IF_ID:#x}"),
     };
     let conn = ConnSection {
-        version: "2".into(),
-        remote_addrs: vec![p.gateway.to_string()],
-        remote_port: p.ike_port.to_string(),
-        encap: "yes".into(),
-        vips: vec!["0.0.0.0".into()],
-        proposals: p.ike_proposals.clone(),
-        keyingtries: "1".into(),
-        dpd_delay: "30s".into(),
+        version: 2,
+        remote_addrs: vec![p.gateway.clone()],
+        remote_port: p.ike_port,
+        encap: true,
+        vips: vec![Ipv4Addr::UNSPECIFIED],
+        proposals: net::ike_proposals(&p.ike_proposals, &p.dh_groups),
+        keyingtries: 1,
+        dpd_delay: 30,
         local,
-        remote: AuthSection { auth: "psk".into(), id: None, eap_id: None },
+        remote: AuthSection { auth: AuthMethod::Psk, id: None, eap_id: None },
         children: BTreeMap::from([(CONN.to_string(), child)]),
     };
     BTreeMap::from([(CONN.to_string(), conn)])
 }
 
 #[derive(Serialize)]
+enum SharedKind {
+    #[serde(rename = "IKE")]
+    Ike,
+    #[serde(rename = "EAP")]
+    Eap,
+}
+
+#[derive(Serialize)]
 struct Shared<'a> {
     id: &'a str,
     #[serde(rename = "type")]
-    kind: &'a str,
+    kind: SharedKind,
     data: &'a str,
     owners: Vec<String>,
 }
@@ -302,14 +315,14 @@ struct Shared<'a> {
 struct Initiate<'a> {
     ike: &'a str,
     child: &'a str,
-    timeout: String,
-    loglevel: String,
+    timeout: u32,
+    loglevel: i32,
 }
 
 #[derive(Serialize)]
 struct Terminate<'a> {
     ike: &'a str,
-    timeout: String,
+    timeout: u32,
 }
 
 #[derive(Serialize)]
@@ -356,6 +369,8 @@ pub fn explain(log: &[String]) -> String {
         "authentication failed: the SSO token was rejected or the pre-shared key is wrong".into()
     } else if has("NO_PROPOSAL_CHOSEN") {
         "the gateway accepts none of the Phase 1/Phase 2 proposals or DH groups in this profile".into()
+    } else if has("TS_UNACCEPTABLE") {
+        "the gateway refused the requested networks (traffic selectors)".into()
     } else if has("giving up after") || has("retransmit") {
         "no answer from the gateway on the IKE port (check the gateway and IKE port)".into()
     } else {
@@ -365,39 +380,39 @@ pub fn explain(log: &[String]) -> String {
 
 /// Load the connection and secrets, initiate, and return what the gateway assigned. Log lines go to `log`.
 pub fn connect(v: &mut Vici, p: &ConnParams, log: &dyn Fn(String)) -> Result<Established, String> {
-    let st: Status = v.request("load-conn", &conn_message(p), Duration::from_secs(5), &mut |_, _| {})?;
+    let st: Status = v.request(Cmd::LoadConn, &conn_message(p), Duration::from_secs(5), &mut |_, _| {})?;
     st.check("loading the connection")?;
-    let mut shared = vec![Shared { id: "fortisaml-psk", kind: "IKE", data: &p.psk.0, owners: vec![] }];
+    let mut shared = vec![Shared { id: "fortisaml-psk", kind: SharedKind::Ike, data: p.psk.expose(), owners: vec![] }];
     if let ClientAuth::Eap { identity, secret } = &p.auth {
-        shared.push(Shared { id: "fortisaml-eap", kind: "EAP", data: &secret.0, owners: vec![identity.clone()] });
+        shared.push(Shared { id: "fortisaml-eap", kind: SharedKind::Eap, data: secret.expose(), owners: vec![identity.to_string()] });
     }
     for s in &shared {
-        let st: Status = v.request("load-shared", s, Duration::from_secs(5), &mut |_, _| {})?;
+        let st: Status = v.request(Cmd::LoadShared, s, Duration::from_secs(5), &mut |_, _| {})?;
         st.check("loading the secrets")?;
     }
-    v.register("control-log")?;
+    v.register(EventName::ControlLog)?;
     let mut lines = Vec::new();
-    let req = Initiate { ike: CONN, child: CONN, timeout: "30000".into(), loglevel: "1".into() };
-    let st: Status = v.request("initiate", &req, Duration::from_secs(40), &mut |_, body| {
+    let req = Initiate { ike: CONN, child: CONN, timeout: 30000, loglevel: 1 };
+    // only to explain a failure: charon's stderr (forwarded to the log) already has every line
+    let st: Status = v.request(Cmd::Initiate, &req, Duration::from_secs(40), &mut |_, body| {
         if let Ok(l) = serde_vici::from_slice::<LogLine>(body) {
-            log(format!("charon: {}", l.msg));
             lines.push(l.msg);
         }
     })?;
-    if st.success != "yes" {
+    if !st.success {
         return Err(explain(&lines));
     }
     // an SA we can't use (no virtual IP, IPv6 gateway) must not stay up at the gateway
-    established(v).inspect_err(|_| terminate(v))
+    established(v, log).inspect_err(|_| terminate(v))
 }
 
 /// The virtual IP and remote traffic selectors of our SA (`list-sas`).
-pub fn established(v: &mut Vici) -> Result<Established, String> {
+pub fn established(v: &mut Vici, log: &dyn Fn(String)) -> Result<Established, String> {
     // charon streams list-sas results as list-sa events, only to clients registered for them
-    v.register("list-sa")?;
+    v.register(EventName::ListSa)?;
     let mut found: Option<IkeInfo> = None;
-    let _: Empty = v.request("list-sas", &ListSas { ike: CONN }, Duration::from_secs(5), &mut |name, body| {
-        if name == "list-sa"
+    let _: Empty = v.request(Cmd::ListSas, &ListSas { ike: CONN }, Duration::from_secs(5), &mut |name, body| {
+        if name == EventName::ListSa
             && let Ok(mut m) = serde_vici::from_slice::<BTreeMap<String, IkeInfo>>(body)
         {
             found = m.remove(CONN);
@@ -410,24 +425,30 @@ pub fn established(v: &mut Vici) -> Result<Established, String> {
         .find_map(|a| a.parse::<Ipv4Addr>().ok())
         .ok_or("the gateway assigned no IPv4 address (Mode Config)")?;
     let gateway = ike.remote_host.parse::<Ipv4Addr>().map_err(|_| format!("gateway address {:?} isn't IPv4", ike.remote_host))?;
-    let remote_ts = ike.child_sas.values().flat_map(|c| c.remote_ts.iter()).filter_map(|t| t.parse::<Ipv4Net>().ok()).collect();
+    let mut remote_ts = Vec::new();
+    for t in ike.child_sas.values().flat_map(|c| c.remote_ts.iter()) {
+        match t.parse::<Ipv4Net>() {
+            Ok(n) => remote_ts.push(n),
+            Err(_) => log(format!("ignoring traffic selector {t} (only IPv4 networks are supported)")),
+        }
+    }
     Ok(Established { gateway, vip, remote_ts })
 }
 
 #[derive(Deserialize, Default)]
 struct UpDown {
     #[serde(default)]
-    up: String,
+    up: bool,
 }
 
 /// An `ike-updown` event body that reports the SA going down (the `up` key is only present when it comes up).
 pub fn is_down(body: &[u8]) -> bool {
-    serde_vici::from_slice::<UpDown>(body).map(|u| u.up != "yes").unwrap_or(false)
+    serde_vici::from_slice::<UpDown>(body).map(|u| !u.up).unwrap_or(false)
 }
 
 /// End the SA (best effort; also fine if it's already gone).
 pub fn terminate(v: &mut Vici) {
-    let _: Result<Status, String> = v.request("terminate", &Terminate { ike: CONN, timeout: "5000".into() }, Duration::from_secs(8), &mut |_, _| {});
+    let _: Result<Status, String> = v.request(Cmd::Terminate, &Terminate { ike: CONN, timeout: 5000 }, Duration::from_secs(8), &mut |_, _| {});
 }
 
 /// Stop a charon left behind by a crashed session. Ours are recognised by the environment we start them with, which
@@ -468,14 +489,20 @@ mod tests {
     use super::*;
 
     fn params() -> ConnParams {
+        use crate::protocol::EapIdentity;
+        use vec1::vec1;
         ConnParams {
             gateway: "vpn.example.com".parse().unwrap(),
-            ike_port: 500,
-            ike_proposals: vec!["aes128-sha1-ecp384".into()],
-            esp_proposals: vec!["aes128-sha1".into()],
+            ike_port: Port::new(500).unwrap(),
+            ike_proposals: vec1!["aes128-sha1".parse().unwrap()],
+            dh_groups: vec1![DhGroup::Ecp384],
+            esp_proposals: vec1!["aes128-sha1".parse().unwrap()],
             local_id: None,
-            auth: ClientAuth::Eap { identity: "0123456789ABCDEF0123456789ABCDEF".into(), secret: Secret("token-secret".into()) },
-            psk: Secret("psk-secret".into()),
+            auth: ClientAuth::Eap {
+                identity: EapIdentity::Uid("0123456789ABCDEF0123456789ABCDEF".parse().unwrap()),
+                secret: Secret::new("token-secret".into()).unwrap(),
+            },
+            psk: Secret::new("psk-secret".into()).unwrap(),
         }
     }
 
@@ -516,52 +543,19 @@ mod tests {
         for want in ["remote_addrs", "vpn.example.com", "encap", "if_id_in", "0x5a17", "eap_id", "0123456789ABCDEF0123456789ABCDEF", "aes128-sha1-ecp384"] {
             assert!(s.contains(want), "missing {want:?}");
         }
-        assert!(!s.contains("token-secret") && !s.contains("psk-secret"), "secrets only go over load-shared");
-    }
-
-    /// Fake charon answering one `list-sas` with a `list-sa` event for `remote_host`.
-    fn list_sas_with(remote_host: &'static str) -> Result<Established, String> {
-        use std::io::{Read, Write};
-        #[derive(Serialize)]
-        struct I {
-            #[serde(rename = "remote-host")]
-            remote_host: &'static str,
-            #[serde(rename = "local-vips")]
-            local_vips: Vec<&'static str>,
+        // VICI key/value element: type 3, key length, key, u16 value length, value
+        let kv = |k: &str, v: &str| {
+            let mut e = vec![3, k.len() as u8];
+            e.extend(k.as_bytes());
+            e.extend((v.len() as u16).to_be_bytes());
+            e.extend(v.as_bytes());
+            e
+        };
+        let has = |needle: Vec<u8>| m.windows(needle.len()).any(|w| w == needle.as_slice());
+        for (k, v) in [("version", "2"), ("remote_port", "500"), ("encap", "yes"), ("keyingtries", "1"), ("dpd_delay", "30"), ("auth", "eap")] {
+            assert!(has(kv(k, v)), "{k} = {v} missing");
         }
-        let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
-        let server = std::thread::spawn(move || {
-            fn next(b: &mut std::os::unix::net::UnixStream) -> crate::vici::Packet {
-                let mut len = [0u8; 4];
-                b.read_exact(&mut len).unwrap();
-                let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
-                b.read_exact(&mut req).unwrap();
-                crate::vici::decode(&req).unwrap()
-            }
-            // like charon: list-sa events only reach clients registered for them
-            let reg = next(&mut b);
-            assert_eq!((reg.kind, reg.name.as_deref()), (3, Some("list-sa")), "register for list-sa first");
-            b.write_all(&crate::vici::encode(5, None, &[])).unwrap();
-            assert_eq!(next(&mut b).name.as_deref(), Some("list-sas"));
-            let ev = serde_vici::to_vec(&BTreeMap::from([(CONN, I { remote_host, local_vips: vec!["10.98.10.1"] })])).unwrap();
-            b.write_all(&crate::vici::encode(7, Some("list-sa"), &ev)).unwrap();
-            b.write_all(&crate::vici::encode(1, None, &[])).unwrap();
-        });
-        let r = established(&mut Vici::from_stream(a));
-        server.join().unwrap();
-        r
-    }
-
-    #[test]
-    fn established_reads_gateway_and_address() {
-        let e = list_sas_with("192.0.2.1").unwrap();
-        assert_eq!((e.gateway, e.vip), (Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(10, 98, 10, 1)));
-        assert!(e.remote_ts.is_empty());
-    }
-
-    #[test]
-    fn ipv6_gateway_is_a_clear_error() {
-        assert_eq!(list_sas_with("2001:db8::1").unwrap_err(), "gateway address \"2001:db8::1\" isn't IPv4");
+        assert!(!s.contains("token-secret") && !s.contains("psk-secret"), "secrets only go over load-shared");
     }
 
     #[test]
@@ -624,7 +618,7 @@ mod tests {
                 }
                 let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
                 b.read_exact(&mut req).unwrap();
-                seen.push(crate::vici::decode(&req).unwrap().name.unwrap_or_default());
+                seen.push(crate::vici::decode(&req).unwrap().unwrap().name().unwrap_or_default().to_string());
                 for r in replies {
                     b.write_all(&r).unwrap();
                 }
@@ -636,7 +630,8 @@ mod tests {
 
     #[test]
     fn connect_terminates_an_sa_it_can_not_use() {
-        let ok = || crate::vici::encode(1, None, &serde_vici::to_vec(&BTreeMap::from([("success", "yes")])).unwrap());
+        use crate::vici::{encode, EventName, Packet};
+        let ok = || encode(&Packet::CmdResponse(serde_vici::to_vec(&BTreeMap::from([("success", "yes")])).unwrap()));
         #[derive(Serialize)]
         struct I {
             #[serde(rename = "remote-host")]
@@ -647,10 +642,10 @@ mod tests {
             ("load-conn", vec![ok()]),
             ("load-shared", vec![ok()]),
             ("load-shared", vec![ok()]),
-            ("control-log", vec![crate::vici::encode(5, None, &[])]),
+            ("control-log", vec![encode(&Packet::EventConfirm)]),
             ("initiate", vec![ok()]),
-            ("list-sa", vec![crate::vici::encode(5, None, &[])]),
-            ("list-sas", vec![crate::vici::encode(7, Some("list-sa"), &ipv6), crate::vici::encode(1, None, &[])]),
+            ("list-sa", vec![encode(&Packet::EventConfirm)]),
+            ("list-sas", vec![encode(&Packet::Event { name: EventName::ListSa, body: ipv6.clone() }), encode(&Packet::CmdResponse(vec![]))]),
             ("terminate", vec![ok()]),
         ]);
         assert!(connect(&mut v, &params(), &|_| {}).is_err(), "no virtual IP, IPv6 gateway: unusable");
@@ -682,6 +677,7 @@ mod tests {
         assert!(explain(&["received AUTHENTICATION_FAILED notify error".into()]).starts_with("authentication failed"));
         assert!(explain(&["received NO_PROPOSAL_CHOSEN notify error".into()]).contains("proposals"));
         assert!(explain(&["giving up after 3 retransmits".into()]).contains("no answer"));
+        assert_eq!(explain(&["received TS_UNACCEPTABLE notify, no CHILD_SA built".into()]), "the gateway refused the requested networks (traffic selectors)");
         assert!(explain(&[]).contains("see the log"));
     }
 
@@ -713,5 +709,105 @@ mod tests {
         assert_eq!(i.local_vips, ["10.98.10.1"]);
         assert_eq!(i.remote_host, "192.0.2.1");
         assert_eq!(i.child_sas["fortisaml-1"].remote_ts, ["10.10.0.0/16", "10.20.0.0/16"]);
+    }
+
+    /// Fake charon answering one `list-sas` with a `list-sa` event for `remote_host` with one child SA narrowed to
+    /// `remote_ts`.
+    fn list_sas_with(remote_host: &'static str, local_vips: Vec<&'static str>, remote_ts: Vec<&'static str>, log: &dyn Fn(String)) -> Result<Established, String> {
+        use std::io::{Read, Write};
+        #[derive(Serialize)]
+        struct C {
+            #[serde(rename = "remote-ts")]
+            remote_ts: Vec<&'static str>,
+        }
+        #[derive(Serialize)]
+        struct I {
+            #[serde(rename = "remote-host")]
+            remote_host: &'static str,
+            #[serde(rename = "local-vips")]
+            local_vips: Vec<&'static str>,
+            #[serde(rename = "child-sas")]
+            child_sas: BTreeMap<&'static str, C>,
+        }
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            fn next(b: &mut std::os::unix::net::UnixStream) -> crate::vici::Packet {
+                let mut len = [0u8; 4];
+                b.read_exact(&mut len).unwrap();
+                let mut req = vec![0u8; u32::from_be_bytes(len) as usize];
+                b.read_exact(&mut req).unwrap();
+                crate::vici::decode(&req).unwrap().unwrap()
+            }
+            use crate::vici::{encode, EventName, Packet};
+            // like charon: list-sa events only reach clients registered for them
+            assert_eq!(next(&mut b), Packet::EventRegister(EventName::ListSa), "register for list-sa first");
+            b.write_all(&encode(&Packet::EventConfirm)).unwrap();
+            assert_eq!(next(&mut b).name(), Some("list-sas"));
+            let child = BTreeMap::from([("fortisaml-1", C { remote_ts })]);
+            let ev = serde_vici::to_vec(&BTreeMap::from([(CONN, I { remote_host, local_vips, child_sas: child })])).unwrap();
+            b.write_all(&encode(&Packet::Event { name: EventName::ListSa, body: ev })).unwrap();
+            b.write_all(&encode(&Packet::CmdResponse(vec![]))).unwrap();
+        });
+        let r = established(&mut Vici::from_stream(a), log);
+        server.join().unwrap();
+        r
+    }
+
+    #[test]
+    fn established_reads_gateway_address_and_selectors() {
+        let e = list_sas_with("192.0.2.1", vec!["10.98.10.1"], vec!["10.10.0.0/16"], &|_| {}).unwrap();
+        assert_eq!((e.gateway, e.vip), (Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(10, 98, 10, 1)));
+        assert_eq!(e.remote_ts, ["10.10.0.0/16".parse::<Ipv4Net>().unwrap()]);
+    }
+
+    #[test]
+    fn ipv6_gateway_is_a_clear_error() {
+        assert_eq!(list_sas_with("2001:db8::1", vec!["10.98.10.1"], vec![], &|_| {}).unwrap_err(), "gateway address \"2001:db8::1\" isn't IPv4");
+    }
+
+    #[test]
+    fn unusable_traffic_selectors_are_logged() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let e = list_sas_with("192.0.2.1", vec!["10.98.10.1"], vec!["10.10.0.0/16", "2001:db8::/32", "10.0.0.1-10.0.0.9"], &|l| seen.borrow_mut().push(l)).unwrap();
+        assert_eq!(e.remote_ts, ["10.10.0.0/16".parse::<Ipv4Net>().unwrap()], "the usable one is kept");
+        assert_eq!(
+            *seen.borrow(),
+            [
+                "ignoring traffic selector 2001:db8::/32 (only IPv4 networks are supported)",
+                "ignoring traffic selector 10.0.0.1-10.0.0.9 (only IPv4 networks are supported)",
+            ]
+        );
+    }
+
+    #[test]
+    fn control_log_explains_failures_without_doubling_the_log() {
+        // charon's stderr already carries these lines; logging them again doubled every one
+        use crate::vici::{encode, EventName, Packet};
+        let ok = || encode(&Packet::CmdResponse(serde_vici::to_vec(&BTreeMap::from([("success", "yes")])).unwrap()));
+        let failed = encode(&Packet::CmdResponse(serde_vici::to_vec(&BTreeMap::from([("success", "no")])).unwrap()));
+        let line = encode(&Packet::Event { name: EventName::ControlLog, body: serde_vici::to_vec(&BTreeMap::from([("msg", "received AUTHENTICATION_FAILED notify error")])).unwrap() });
+        let (mut v, h) = fake_charon(vec![
+            ("load-conn", vec![ok()]),
+            ("load-shared", vec![ok()]),
+            ("load-shared", vec![ok()]),
+            ("control-log", vec![encode(&Packet::EventConfirm)]),
+            ("initiate", vec![line, failed]),
+        ]);
+        let logged = std::cell::RefCell::new(Vec::new());
+        let e = connect(&mut v, &params(), &|l| logged.borrow_mut().push(l)).unwrap_err();
+        drop(v);
+        h.join().unwrap();
+        assert!(e.starts_with("authentication failed"), "{e}");
+        assert!(logged.borrow().is_empty(), "{:?}", logged.borrow());
+    }
+
+    #[test]
+    fn verbose_logging_leaves_out_charon_bookkeeping() {
+        // at level 2 the fd watcher, the SA manager's checkout/checkin and the job queue were a quarter of the log
+        let c = config(20, true, None);
+        assert!(c.contains("default = 2"), "{c}");
+        for quiet in ["wch = 1", "mgr = 1", "job = 1"] {
+            assert!(c.contains(quiet), "missing {quiet:?} in\n{c}");
+        }
     }
 }

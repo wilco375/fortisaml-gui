@@ -8,9 +8,8 @@ A native Linux client for **FortiGate dial-up IPsec (IKEv2) VPNs with SAML singl
 
 - **SAML SSO:** login in your normal browser, with a local callback.
 - **Username/password (EAP)** and **pre-shared-key-only** modes when SSO is off.
-- **IKEv2 by strongSwan:** a private `charon` instance negotiates, rekeys and runs dead-peer detection, with configurable phase 1 and phase 2 proposals (AES-128/192/256-CBC, SHA1/256/384/512) and DH groups 14, 19, 20 and 21.
+- **Encryption and tunneling** are handled by the robust strongSwan package.
 - **EAP methods:** MSCHAPv2, GTC and MD5 (the FortiGate picks one). The gateway is authenticated with the PSK.
-- **Kernel IPsec:** XFRM with UDP-encapsulated ESP, bound to an `fsaml0` xfrm interface. The kernel carries all traffic.
 - **Routing:** split tunnel as pushed by the gateway, full tunnel, or a custom network list. In full-tunnel mode IPv6 is blocked so it can't leak around the VPN.
 - **DNS** from the VPN, handed to the system through `resolvconf` (systemd-resolved, openresolv or Debian resolvconf). In full-tunnel mode all queries go to the VPN when systemd-resolved is used.
 - **Root only while setting up:** a `pkexec` prompt appears on Connect. After the tunnel is up, the backend switches to your user and keeps only the network-admin and kill capabilities. The GUI itself never runs as root.
@@ -53,7 +52,6 @@ The binary is self-contained. When you connect, it starts a second copy of itsel
 
 **Settings (⚙):**
 - **Client UID:** the FortiClient-style installation ID sent to the FortiGate. You can regenerate it.
-- **Log file:** an optional path; the log is also shown in the 📜 Log panel.
 - **Verbose logging:** encryption keys are always redacted.
 
 ### Command-line modes
@@ -61,15 +59,7 @@ The binary is self-contained. When you connect, it starts a second copy of itsel
 | Command | Purpose |
 |---|---|
 | `fortisaml-gui` | Start the GUI |
-| `fortisaml-gui --probe [options]` | **Test:** SSO + IKEv2/EAP negotiation with the selected profile through strongSwan (asks for root via pkexec), then delete the SA. No interface, routes or DNS are set up. |
-| `sudo fortisaml-gui --down [ifname]` | Remove leftovers of a crashed session (interface, routes, a stray private charon) |
 | `fortisaml-gui --backend` | Internal: the privileged backend started by pkexec |
-
-`--probe` options:
-- override the profile: `--gateway H`, `--saml-port P`, `--ike-port P`, `--psk K`
-- certificate and browser: `--no-verify` (skip TLS certificate checks), `--no-browser` (don't open the browser)
-- credentials: `--token T` (use an existing SSO token), `--no-sso --username U --password P` (username/password login), `--no-eap` (PSK only)
-- `-v` for verbose output
 
 Environment: `FORTISAML_BROWSER=<command>` replaces `xdg-open` for opening the SSO page.
 
@@ -97,16 +87,17 @@ sequenceDiagram
 - The GUI never runs as root. The backend is root only while it sets up the tunnel; then it switches to your user and keeps only two capabilities: network admin, to tear the tunnel down again, and kill, to stop its strongSwan instance.
 - IKE, rekeying and the kernel IPsec SAs are handled by strongSwan's charon, run as a private instance with its own config and control socket. It stops when the backend exits.
 - Secrets (PSK, SSO token, password) reach the backend over a pipe, never on the command line, and reach charon over its control socket, never in a file. The stdin pipe then acts as the control channel: a `disconnect` line, or EOF when the GUI exits or crashes, makes the backend clean up and exit.
+- If the backend is killed outright, its interface and routes stay behind until the next Connect (or a reboot), which removes them.
 - Traffic is encrypted by the kernel.
 
 ### Source layout
 
 | File | Role |
 |---|---|
-| `src/main.rs` | egui UI; dispatches `--backend` / `--probe` / `--down` |
+| `src/main.rs` | egui UI; dispatches `--backend` |
 | `src/config.rs` | profile model, defaults, TOML settings files and state |
 | `src/keyring.rs` | PSK / password storage in the Secret Service |
-| `src/backend.rs` | connection session, pkexec bridge, privileged session (charon + tunnel + privilege drop), probe mode |
+| `src/backend.rs` | connection session, pkexec bridge, privileged session (charon + tunnel + privilege drop) |
 | `src/charon.rs` | private strongSwan charon: config, start, connection and secrets over VICI, error messages |
 | `src/vici.rs` | strongSwan VICI client |
 | `src/net.rs` | checked value types (interface names, networks, DNS names, proposals, secrets) |
@@ -120,11 +111,13 @@ sequenceDiagram
 ## Configuration and security
 
 - Settings are saved when you click **Save**, under `~/.config/fortisaml-gui/` (or `$XDG_CONFIG_HOME`), mode `0600` in a `0700` directory. Closing with unsaved changes asks first.
-  - `config.toml`: app settings (client UID, log file, verbose logging).
+  - `config.toml`: app settings (client UID, verbose logging).
   - `profiles/<connection name>.toml`: one file per connection. To share a connection, click **🔗 Share** and send the file. The recipient puts it in their `profiles/` folder, restarts the app and enters the PSK.
   - Both only contain settings that differ from the defaults.
 - `~/.local/state/fortisaml-gui/state.json` (or `$XDG_STATE_HOME`) holds which connection is selected and the internal ids that link connections to their keyring items. The app manages it; don't edit it.
 - A connection file that can't be read is reported at startup and left untouched. A `config.toml` that can't be read is reported and replaced when you click **Save**. Older `config.json` files are not read.
+- Every setting is checked when a file is read and while you type. A connection file with an invalid value (an interface name with a space, a route such as `10.1.2.3/16` with host bits set, a username with non-ASCII characters) is reported and left alone. In the editor, a field that's refused says why underneath, and Save and Connect stay disabled until it's fixed; the connection is marked ⚠ in the list.
+- `custom_routes` is a list: `custom_routes = ["10.0.0.0/8", "192.168.10.0/24"]`. Files with the older single string (`"10.0.0.0/8, 192.168.10.0/24"`) still load and are written as a list on the next Save.
 - The **PSK** and a **saved password** are not in these files. They're stored in your desktop keyring through the freedesktop Secret Service, as items labelled `FortiSAML VPN: <connection> (PSK)` / `(password)`. Without a Secret Service they're kept in memory until the app closes.
 - A password is stored only if *Save password* is ticked; otherwise it lives in memory until the app closes.
 - The SSO token is single-use and never written to disk.
@@ -144,24 +137,11 @@ cargo test                       # unit tests: value checks, VICI, charon config
 ./scripts/netns-test.sh          # kernel tests, each in a throwaway network namespace (no root needed)
 ```
 
-End-to-end tests run against the mock FortiGate in `../poc/tests/`. The mock is a Python test harness only; the client doesn't depend on it. It offers HTTPS SSO with a fake identity provider and an IKEv2 responder supporting MSCHAPv2/GTC, username/password, and PSK-only:
-
-```bash
-cd ../poc/tests
-python3 mock_fortigate.py --eap mschapv2 --psk testpsk &       # add --user U --password P, or --no-eap
-FORTISAML_BROWSER=$PWD/fake_browser.py \
-  ../../fortisaml-gui/target/release/fortisaml-gui --probe --gateway 127.0.0.1 \
-  --saml-port 10443 --ike-port 5500 --psk testpsk --no-verify -v
-```
-
-Against a real gateway (no root needed, nothing installed): `fortisaml-gui --probe -v`.
+End-to-end: connect with the app (turn on verbose logging in Settings) and check the tunnel with `ip -br addr show fsaml0` and `ip route show proto 233`.
 
 ## Limitations
 
-- **No rekeying.** Gateway-initiated `CREATE_CHILD_SA` rekeys are not handled. The tunnel stops working when the phase 2 lifetime (default 43200 s = 12 h) or the IKE SA lifetime expires; reconnect when that happens.
 - **IPv4 only:** the inner tunnel and the gateway address are IPv4.
-- **Encryption:** AES-CBC only, no AES-GCM or ChaCha20.
-- **Gateway certificate authentication** (AUTH methods other than PSK) is accepted with a warning but **not verified**.
 - **Not supported:**
   - IKEv1, IKE over TCP / "IPsec over TCP"
   - FortiToken push / OTP challenges
