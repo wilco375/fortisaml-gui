@@ -366,6 +366,13 @@ pub struct Proposal {
     pub hash: Hash,
 }
 
+/// What "Add proposal" starts with.
+impl Default for Proposal {
+    fn default() -> Self {
+        Proposal { enc: Encryption::Aes256, hash: Hash::Sha256 }
+    }
+}
+
 impl FromStr for Proposal {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {

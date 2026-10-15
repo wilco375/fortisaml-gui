@@ -382,10 +382,11 @@ fn save_button_says_what_state_you_are_in() {
     ctx.enable_accesskit();
     app_frame(&ctx, &mut app, vec![]);
     let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
-    assert!(button(&nodes, "✔ Saved").is_some());
+    assert!(label_shown(&nodes, "All changes saved"));
+    assert!(button(&nodes, "Save changes").is_none());
     app.cfg.profiles[0].description = "dirty".into();
     let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
-    assert!(button(&nodes, "💾 Save changes").is_some());
+    assert!(button(&nodes, "Save changes").is_some());
 }
 
 #[test]
@@ -410,11 +411,11 @@ fn login_link_can_be_copied() {
     ctx.enable_accesskit();
     app_frame(&ctx, &mut app, vec![]);
     let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
-    assert!(button(&nodes, "🌐 Open login page").is_some());
-    let (_, copied) = app_frame(&ctx, &mut app, vec![click_event(&nodes, "📋 Copy link")]);
+    assert!(button(&nodes, "Open login page").is_some());
+    let (_, copied) = app_frame(&ctx, &mut app, vec![click_event(&nodes, "Copy link")]);
     assert_eq!(copied, ["https://idp.example/login"]);
     let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
-    assert!(button(&nodes, "✔ Copied").is_some());
+    assert!(button(&nodes, "Copied").is_some());
 }
 
 #[test]
@@ -476,14 +477,68 @@ fn regenerate_uid_asks_first() {
 /// Fonts::has_glyphs can't be used: it reports every NotoEmoji char as missing, because that face also holds the
 /// replacement glyph. Look the chars up in the fonts' character maps instead.
 #[test]
-fn new_button_glyphs_exist_in_default_fonts() {
+fn text_glyphs_exist_in_the_app_fonts() {
     let ctx = egui::Context::default();
-    ctx.run_ui(Default::default(), |_| {}).drop_without_applying_deltas();
-    let has = |c: char| ctx.fonts_mut(|f| f.fonts.font(&egui::FontFamily::Proportional).characters().contains_key(&c));
-    assert!(!has('●') && !has('⧉'), "the check must catch the glyphs f21fbf3 replaced");
-    for label in ["📂 Open folder", "🔗 Share", "Regenerate", "Cancel"] {
-        assert!(label.chars().all(has), "{label}");
+    for _ in 0..2 {
+        // fonts first, then the style that uses them
+        ctx.run_ui(Default::default(), |ui| theme::install(ui.ctx())).drop_without_applying_deltas();
     }
+    let has = |family: egui::FontFamily, c: char| ctx.fonts_mut(|f| f.fonts.font(&family).characters().contains_key(&c));
+    let proportional = |c| has(egui::FontFamily::Proportional, c);
+    assert!(!proportional('漢'), "the check must catch a missing glyph");
+    for text in ["Browse…", "Connected · 01:02:05", "Delete “Office”?", "⚠ Fix the fields", "—"] {
+        assert!(text.chars().all(proportional), "{text}");
+    }
+    let icons = egui::FontFamily::Name("icons".into());
+    for glyph in [theme::icon::PLUGS, theme::icon::PLUGS_CONNECTED, theme::icon::GEAR_SIX, theme::icon::DOTS_THREE_VERTICAL] {
+        assert!(glyph.chars().all(|c| has(icons.clone(), c)), "{glyph:?}");
+    }
+}
+
+#[test]
+fn log_is_closed_until_asked_for() {
+    let _t = TempConfig::new();
+    let mut app = app_with(&MemoryStore::default());
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    app_frame(&ctx, &mut app, vec![]);
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    assert!(button(&nodes, "Close log").is_none());
+    app_frame(&ctx, &mut app, vec![click_event(&nodes, "Log")]);
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    app_frame(&ctx, &mut app, vec![click_event(&nodes, "Close log")]);
+    assert!(!app.cfg.show_log);
+}
+
+#[test]
+fn settings_is_a_page_with_a_way_back() {
+    let _t = TempConfig::new();
+    let mut app = app_with(&MemoryStore::default());
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    app_frame(&ctx, &mut app, vec![]);
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    app_frame(&ctx, &mut app, vec![click_event(&nodes, "Settings")]);
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    assert!(button(&nodes, "Regenerate").is_some());
+    assert!(button(&nodes, "Connect").is_none(), "the page replaces the connection view");
+    app_frame(&ctx, &mut app, vec![click_event(&nodes, "Back")]);
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    assert!(button(&nodes, "Connect").is_some());
+}
+
+#[test]
+fn connection_buttons_duplicate() {
+    let _t = TempConfig::new();
+    let mut app = app_with(&MemoryStore::default());
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    app_frame(&ctx, &mut app, vec![]);
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    assert!(button(&nodes, "Delete").is_none(), "the only connection can't be deleted");
+    app_frame(&ctx, &mut app, vec![click_event(&nodes, "Duplicate")]);
+    assert_eq!(app.cfg.profiles.len(), 2);
+    assert_eq!(app.cfg.selected, 1, "the copy is selected");
 }
 
 // ---- drafts and problems ----
@@ -511,7 +566,7 @@ fn invalid_draft_blocks_save_and_ctrl_s() {
     app_frame(&ctx, &mut app, vec![ctrl_s]);
     assert!(!file().contains("dirty"), "nothing saved");
     let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
-    assert!(button(&nodes, "💾 Save changes").unwrap().is_disabled());
+    assert!(button(&nodes, "Save changes").unwrap().is_disabled());
     assert!(button(&nodes, "Connect").unwrap().is_disabled(), "the selected profile has the problem");
     assert!(label_shown(&nodes, "⚠ Expected a host name or IPv4 address, not \"vpn example\"."));
     let key = (DraftOwner::Profile(app.cfg.profiles[0].id.clone()), Field::Gateway);
@@ -533,7 +588,7 @@ fn invalid_draft_on_another_profile_is_marked() {
     let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
     assert!(label_shown(&nodes, "⚠ New connection"), "the profile with the problem is marked");
     assert!(label_shown(&nodes, "Second"));
-    assert!(button(&nodes, "💾 Save changes").unwrap().is_disabled());
+    assert!(button(&nodes, "Save changes").unwrap().is_disabled());
     assert!(!button(&nodes, "Connect").unwrap().is_disabled(), "the selected profile is fine");
 }
 
@@ -548,9 +603,10 @@ fn deleting_a_profile_drops_its_drafts() {
     ctx.enable_accesskit();
     app_frame(&ctx, &mut app, vec![]);
     let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
-    app_frame(&ctx, &mut app, vec![click_event(&nodes, "🗑 Delete")]); // arms it; the next frame shows "Confirm delete"
+    app_frame(&ctx, &mut app, vec![click_event(&nodes, "Delete")]); // the row's button; the next frame asks
     let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
-    app_frame(&ctx, &mut app, vec![click_event(&nodes, "Confirm delete")]);
+    assert_eq!(app.cfg.profiles.len(), 2, "not before it's confirmed");
+    app_frame(&ctx, &mut app, vec![click_event(&nodes, "Delete connection")]);
     assert_eq!(app.cfg.profiles.len(), 1);
     assert!(!app.drafts.has_errors() && app.problems().is_empty());
 }
@@ -592,8 +648,10 @@ fn backend_events_drive_the_status() {
     assert_eq!((app.info.ip, app.info.routes.len(), app.info.full_tunnel), (Some(ip), 1, false));
     app.on_backend(BackendEvent::Connected);
     assert_eq!(app.state, State::Connected);
+    let logged = app.log.len();
     app.on_backend(BackendEvent::Error { message: "no answer".into() });
-    assert_eq!(app.error.as_deref(), Some("no answer"));
+    assert_eq!(app.log.len(), logged, "the backend logged it already");
+    assert_eq!(app.error.as_deref(), Some("error: couldn't connect\n  note: no answer\n  help: the log has the details"), "shown like the app's other errors");
 }
 
 #[test]
@@ -622,6 +680,7 @@ fn a_field_the_mode_does_not_use_does_not_block() {
     assert_eq!(app.problems().len(), 1, "it counts again once the username is used");
     assert_eq!(app.drafts.text(&key), Some("jané"), "what was typed is kept");
 }
+
 
 // ---- typing character by character ----
 
@@ -657,7 +716,7 @@ fn type_slowly(ctx: &egui::Context, app: &mut App, f: Field, text: &str) -> Vec<
 }
 
 #[test]
-fn typing_an_invalid_gateway_keeps_focus_and_the_label_level() {
+fn typing_an_invalid_gateway_keeps_focus_and_the_label_above_the_field() {
     let _t = TempConfig::new();
     let mut app = app_with(&MemoryStore::default());
     let ctx = egui::Context::default();
@@ -670,8 +729,7 @@ fn typing_an_invalid_gateway_keeps_focus_and_the_label_level() {
     let label = nodes.iter().find(|(_, n)| n.role() == Role::Label && n.value() == Some("Remote gateway")).unwrap().1.clone();
     let lb = label.bounds().unwrap();
     let fb = field.bounds().unwrap();
-    let cy = (lb.y0 + lb.y1) / 2.0;
-    assert!(fb.y0 <= cy && cy <= fb.y1, "label at {lb:?} isn't level with the field at {fb:?}");
+    assert!(lb.y1 <= fb.y0 && fb.y0 - lb.y1 < 12.0 && (lb.x0 - fb.x0).abs() < 1.0, "label at {lb:?} isn't right above the field at {fb:?}");
 }
 
 #[test]
@@ -703,4 +761,103 @@ fn an_older_file_format_counts_as_a_change_until_saved() {
     assert_eq!(app.save_error, None);
     assert!(!app.unsaved());
     assert_eq!(std::fs::read_to_string(paths.profile_file("Old")).unwrap(), "");
+}
+
+#[test]
+fn window_icon_decodes() {
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/archway-vpn-256.png")).unwrap();
+    assert_eq!((icon.width, icon.height), (256, 256));
+}
+
+#[test]
+fn theme_installs_before_the_first_frame() {
+    // what main() does in eframe's creation callback, before any frame has run
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    ctx.run_ui(Default::default(), |ui| theme::install(ui.ctx())).drop_without_applying_deltas();
+}
+
+#[test]
+fn a_problem_does_not_move_the_page() {
+    let _t = TempConfig::new();
+    let mut app = app_with(&MemoryStore::default());
+    // two connections: the selected row shows all three buttons (Duplicate, Share, Delete)
+    app.cfg.profiles.push(Profile { name: "Second".into(), ..Profile::default() });
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    // fonts, then style: the layout is final from the third frame on
+    app_frame(&ctx, &mut app, vec![]);
+    app_frame(&ctx, &mut app, vec![]);
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    let before = field_node(&nodes, Field::Gateway).1.bounds();
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    assert_eq!(field_node(&nodes, Field::Gateway).1.bounds(), before, "the layout is stable without changes");
+    // the Settings page is closed: the problem only shows in the status card
+    app.drafts.edit((DraftOwner::App, Field::Uid), "x".into(), &mut app.cfg.uid);
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    assert!(label_shown(&nodes, "⚠ Settings: Client UID: The client UID must be 32 hexadecimal characters."));
+    assert_eq!(field_node(&nodes, Field::Gateway).1.bounds(), before);
+}
+
+#[test]
+fn hovering_a_button_does_not_move_the_others() {
+    let _t = TempConfig::new();
+    let mut app = app_with(&MemoryStore::default());
+    app.cfg.profiles.push(Profile { name: "Second".into(), ..Profile::default() });
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    for _ in 0..3 {
+        app_frame(&ctx, &mut app, vec![]);
+    }
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    let bounds = |nodes: &[(egui::accesskit::NodeId, egui::accesskit::Node)], label: &str| button(nodes, label).and_then(|n| n.bounds()).unwrap();
+    // frameless buttons: top bar, the selected row's buttons
+    for (hover, watch) in [("Settings", "Log"), ("Log", "Settings"), ("Delete", "Duplicate"), ("Duplicate", "Share")] {
+        let (h, w) = (bounds(&nodes, hover), bounds(&nodes, watch));
+        let at = egui::pos2(((h.x0 + h.x1) / 2.0) as f32, ((h.y0 + h.y1) / 2.0) as f32);
+        app_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(at)]);
+        let (hovered, _) = app_frame(&ctx, &mut app, vec![]);
+        assert_eq!(bounds(&hovered, watch), w, "hovering {hover} moved {watch}");
+        assert_eq!(bounds(&hovered, hover), h, "hovering {hover} resized it");
+    }
+}
+
+#[test]
+fn a_field_warning_does_not_move_what_is_below() {
+    let _t = TempConfig::new();
+    let mut app = app_with(&MemoryStore::default());
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    for _ in 0..3 {
+        app_frame(&ctx, &mut app, vec![]);
+    }
+    let psk = |nodes: &[(egui::accesskit::NodeId, egui::accesskit::Node)]| {
+        nodes.iter().find(|(_, n)| n.role() == Role::PasswordInput && n.label() == Some("Pre-shared key")).and_then(|(_, n)| n.bounds()).unwrap()
+    };
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    let before = psk(&nodes);
+    type_bad_gateway(&mut app, 0);
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    assert!(label_shown(&nodes, "⚠ Expected a host name or IPv4 address, not \"vpn example\"."));
+    assert_eq!(psk(&nodes), before);
+}
+
+#[test]
+fn the_log_draws_only_the_lines_in_view() {
+    let _t = TempConfig::new();
+    let mut app = app_with(&MemoryStore::default());
+    app.push_log("error: first\n  note: second".into());
+    assert_eq!(app.log[app.log.len() - 2..], ["error: first", "  note: second"], "one row per line");
+    for i in 0..3000 {
+        app.push_log(format!("line {i}"));
+    }
+    app.cfg.show_log = true;
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    for _ in 0..3 {
+        app_frame(&ctx, &mut app, vec![]);
+    }
+    let (nodes, _) = app_frame(&ctx, &mut app, vec![]);
+    let drawn = nodes.iter().filter(|(_, n)| n.value().is_some_and(|v| v.starts_with("line "))).count();
+    assert!(drawn > 0 && drawn < 100, "{drawn} log lines laid out");
 }

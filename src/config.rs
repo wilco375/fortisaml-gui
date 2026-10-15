@@ -17,6 +17,9 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+/// A new profile's xfrm interface.
+pub const DEFAULT_IFNAME: &str = "archway0";
+
 /// Groups shown by the official client but not implemented here (rendered disabled).
 pub const DH_UNSUPPORTED: [u16; 8] = [1, 2, 5, 15, 16, 17, 18, 31];
 
@@ -212,7 +215,7 @@ impl Default for Network {
             custom_routes: Vec::new(),
             block_ipv6: true,
             set_dns: true,
-            ifname: "archway0".parse().expect("valid interface name"),
+            ifname: DEFAULT_IFNAME.parse().expect("valid interface name"),
             mtu: Mtu::try_from(1400).expect("in range"),
         }
     }
@@ -268,7 +271,7 @@ impl Default for Config {
             selected: 0,
             uid: ClientUid::generate().expect(RNG_FAILED),
             verbose: false,
-            show_log: true,
+            show_log: false,
             unreadable: BTreeMap::new(),
             orphans: Vec::new(),
             outdated: HashSet::new(),
@@ -286,7 +289,7 @@ struct AppFile {
 }
 
 /// state.json
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct StateFile {
     /// profile name -> id
@@ -295,12 +298,6 @@ struct StateFile {
     /// name of the selected profile
     selected: String,
     show_log: bool,
-}
-
-impl Default for StateFile {
-    fn default() -> Self {
-        Self { ids: BTreeMap::new(), orphans: Vec::new(), selected: String::new(), show_log: true }
-    }
 }
 
 /// A fresh random id (profile keyring keys). Panics only if the OS random number generator fails, instead of
@@ -426,15 +423,15 @@ impl Config {
 
     /// Per profile: why its name can't be saved, if it can't (the per-name rules are in `ProfileName`).
     pub fn name_problems(&self) -> Vec<Option<&'static str>> {
-        let mut seen = HashSet::new();
-        self.profiles
-            .iter()
-            .map(|p| {
-                (!seen.insert(&p.name))
-                    .then_some("Another connection already has this name.")
-                    .or_else(|| self.unreadable.contains_key(p.name.as_str()).then_some("A connection file with this name couldn't be read."))
-            })
-            .collect()
+        (0..self.profiles.len()).map(|i| self.name_problem(i)).collect()
+    }
+
+    /// Why profile `i`'s name can't be saved: an earlier profile has it, or an unreadable file does.
+    pub fn name_problem(&self, i: usize) -> Option<&'static str> {
+        let name = &self.profiles[i].name;
+        (self.profiles[..i].iter().any(|p| &p.name == name))
+            .then_some("Another connection already has this name.")
+            .or_else(|| self.unreadable.contains_key(name.as_str()).then_some("A connection file with this name couldn't be read."))
     }
 
     /// `base`, or `base 2`, `base 3`, ...: the first name no profile (or unreadable file) uses.
