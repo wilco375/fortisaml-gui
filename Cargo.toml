@@ -1,13 +1,19 @@
 [package]
-name = "fortisaml-gui"
+name = "archway-vpn"
 version = "0.1.0"
 edition = "2024"
+authors = ["Wilco van Beijnum <github@wilcovanbeijnum.nl>"]
+description = "Connect to FortiGate IPsec (IKEv2) VPNs with SAML single sign-on"
 license = "MIT OR Apache-2.0"
+# TODO: change to the Archway repo once it is renamed
+repository = "https://github.com/wilco375/fortisaml-gui"
+homepage = "https://github.com/wilco375/fortisaml-gui"
 
 [dependencies]
 async-io = "2.6.0"
 eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow", "links", "wayland", "x11"] }
-env_logger = "0.11.11"
+egui-phosphor = "0.14"
+env_logger = { version = "0.11.11", default-features = false, features = ["auto-color", "humantime"] }
 futures-util = "0.3.34"
 getrandom = "0.4"
 ipnet = "2.12"
@@ -27,3 +33,94 @@ vec1 = { version = "1.12", features = ["serde"] }
 x509-parser = "0.18.1"
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 zeroize = "1.9"
+
+[profile.release]
+strip = true
+# a binary a third smaller (22.6 -> 14.5 MB) for a slower release build; the UI is no slower to draw at "s"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+
+# Release packages: `cargo deb` and `cargo generate-rpm` (see .github/workflows/release.yml). Dependencies are listed by
+# hand: the GUI libs are dlopen()ed, so automatic detection would miss them.
+[package.metadata.deb]
+copyright = "2026 Wilco van Beijnum"
+extended-description = """\
+Archway drives a private strongSwan charon instance and asks for root \
+through pkexec only while the tunnel is being set up."""
+section = "net"
+priority = "optional"
+depends = [
+    # charon-systemd is the binary the app starts; the plugin packages hold openssl, eap-mschapv2, eap-gtc, eap-md5
+    "charon-systemd",
+    "libstrongswan-standard-plugins",
+    "libcharon-extra-plugins",
+    "libcharon-extauth-plugins",
+    "pkexec",
+    # dlopen()ed by winit/glutin/zbus
+    "libegl1",
+    "libgl1",
+    "libwayland-client0",
+    "libwayland-egl1",
+    "libxkbcommon0",
+    # The eframe "x11" feature: winit dlopen()s these only in an X11 session (libX11, libXcursor, libX11-xcb, libXi in
+    # XConnection::new; libxcb through x11rb; libxkbcommon-x11). Hard dependencies so X11 users always get a starting app;
+    # on Wayland they cost little, as Xwayland already brings them.
+    "libx11-6",
+    "libx11-xcb1",
+    "libxcb1",
+    "libxcursor1",
+    "libxi6",
+    "libxkbcommon-x11-0",
+    # opens the SSO login page in the browser (src/saml.rs, opener crate)
+    "xdg-utils",
+    "libc6",
+    "libgcc-s1",
+]
+# no Secret Service provider listed: Debian/Ubuntu have no virtual package for it
+recommends = ["libgl1-mesa-dri", "libegl-mesa0"]
+# target/release is cargo-deb's placeholder for the real target dir; keep it as written
+assets = [
+    ["target/release/archway-vpn", "usr/bin/", "755"],
+    ["assets/archway-vpn.desktop", "usr/share/applications/", "644"],
+    ["assets/archway-vpn.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["LICENSE-MIT", "usr/share/doc/archway-vpn/", "644"],
+    ["LICENSE-APACHE", "usr/share/doc/archway-vpn/", "644"],
+]
+
+[package.metadata.generate-rpm]
+# requires below are complete; rpm's own detection only sees linked libs
+auto-req = "no"
+assets = [
+    { source = "target/release/archway-vpn", dest = "/usr/bin/archway-vpn", mode = "755" },
+    { source = "assets/archway-vpn.desktop", dest = "/usr/share/applications/archway-vpn.desktop", mode = "644" },
+    { source = "assets/archway-vpn.svg", dest = "/usr/share/icons/hicolor/scalable/apps/archway-vpn.svg", mode = "644" },
+    { source = "LICENSE-MIT", dest = "/usr/share/licenses/archway-vpn/LICENSE-MIT", mode = "644", doc = true },
+    { source = "LICENSE-APACHE", dest = "/usr/share/licenses/archway-vpn/LICENSE-APACHE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+strongswan = "*"
+polkit = "*"
+# dlopen()ed by winit/glutin/zbus
+libwayland-client = "*"
+libwayland-egl = "*"
+libxkbcommon = "*"
+libglvnd-egl = "*"
+libglvnd-glx = "*"
+# The eframe "x11" feature: winit dlopen()s these only in an X11 session (libX11, libXcursor, libX11-xcb, libXi in
+# XConnection::new; libxcb through x11rb; libxkbcommon-x11). Hard dependencies so X11 users always get a starting app;
+# on Wayland they cost little, as Xwayland already brings them.
+libX11 = "*"
+libX11-xcb = "*"
+libxcb = "*"
+libXcursor = "*"
+libXi = "*"
+libxkbcommon-x11 = "*"
+xdg-utils = "*"
+glibc = "*"
+libgcc = "*"
+
+# no Secret Service provider listed: Fedora has no generic provide for it
+[package.metadata.generate-rpm.recommends]
+mesa-dri-drivers = "*"

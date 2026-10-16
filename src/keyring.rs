@@ -38,7 +38,7 @@ pub trait SecretStore {
 
 /// Item label shown in Seahorse / KWallet / KeePassXC.
 pub fn item_label(profile_name: &str, kind: Kind) -> String {
-    format!("FortiSAML VPN: {profile_name} ({})", kind.name())
+    format!("Archway VPN: {profile_name} ({})", kind.name())
 }
 
 #[derive(PartialEq)]
@@ -227,8 +227,8 @@ pub struct SecretServiceStore {
     ss: SecretService<'static>,
 }
 
-fn attrs<'a>(profile_id: &'a str, kind: Option<Kind>) -> HashMap<&'a str, &'a str> {
-    let mut a = HashMap::from([("application", "fortisaml-gui"), ("profile", profile_id)]);
+fn attrs(profile_id: &str, kind: Option<Kind>) -> HashMap<&str, &str> {
+    let mut a = HashMap::from([("application", "archway-vpn"), ("profile", profile_id)]);
     if let Some(k) = kind {
         a.insert("kind", k.attr());
     }
@@ -318,10 +318,13 @@ pub mod testing {
     use std::collections::HashMap;
     use std::rc::Rc;
 
-    /// (profile id, kind) -> (label, secret), shared between clones; `fail` makes every write of that kind fail.
+    /// (profile id, kind attribute) -> (label, secret)
+    type Items = HashMap<(String, &'static str), (String, String)>;
+
+    /// Items shared between clones; `fail` makes every write of that kind fail.
     #[derive(Clone, Default)]
     pub struct MemoryStore {
-        pub items: Rc<RefCell<HashMap<(String, &'static str), (String, String)>>>,
+        pub items: Rc<RefCell<Items>>,
         pub fail: Option<Kind>,
         pub fail_delete: bool,
     }
@@ -460,7 +463,7 @@ mod tests {
         assert!(next.settings_eq(&cfg));
         assert_eq!(store.get(&cfg.profiles[0].id, Kind::Psk).unwrap().as_deref(), Some("k"));
         let (label, _) = store.items.borrow()[&(cfg.profiles[0].id.clone(), "psk")].clone();
-        assert_eq!(label, "FortiSAML VPN: Office (PSK)");
+        assert_eq!(label, "Archway VPN: Office (PSK)");
     }
 
     #[test]
@@ -531,7 +534,7 @@ mod tests {
     #[ignore = "needs a running Secret Service: cargo test -- --ignored"]
     fn secret_service_roundtrip() {
         let s = SecretServiceStore::connect().unwrap_or_else(|u| panic!("{}", u.message()));
-        let id = "fortisaml-gui-test-0000";
+        let id = "archway-vpn-test-0000";
         let label = item_label("test", Kind::Psk);
         s.set(id, Kind::Psk, &label, "s3cret").unwrap();
         assert_eq!(s.get(id, Kind::Psk).unwrap().as_deref(), Some("s3cret"));
@@ -540,7 +543,7 @@ mod tests {
         let c = s.collection().unwrap();
         let items = c.search_items(attrs(id, Some(Kind::Psk))).unwrap();
         assert_eq!(items.len(), 1, "replaced, not duplicated");
-        assert_eq!(items[0].get_label().unwrap(), "FortiSAML VPN: renamed (PSK)", "label follows a rename");
+        assert_eq!(items[0].get_label().unwrap(), "Archway VPN: renamed (PSK)", "label follows a rename");
         s.set(id, Kind::Password, &item_label("test", Kind::Password), "pw").unwrap();
         s.set(id, Kind::Password, "", "").unwrap();
         assert_eq!(s.get(id, Kind::Password).unwrap(), None, "empty secret deletes");

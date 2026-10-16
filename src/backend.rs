@@ -83,19 +83,27 @@ impl Session {
             std::thread::sleep(Duration::from_millis(50));
         }
         self.shared.lock().unwrap().backend_stdin.take(); // EOF => backend tears down regardless
-        if let Some(t) = self.thread.take() {
-            if t.is_finished() {
+        if let Some(t) = self.thread.take()
+            && t.is_finished() {
                 let _ = t.join();
             }
-        }
     }
+}
+
+/// "error: can't connect without {what}", with why it's needed and where to enter it (see `diag`).
+fn missing(what: &str, why: &str, help: &str) -> String {
+    crate::diag("error", &format!("can't connect without {what}"), why, help)
+}
+
+fn no_token() -> String {
+    crate::diag("error", "the SSO login gave no token", "the login page finished without handing one over", "connect again and sign in once more")
 }
 
 /// How profile `p` authenticates: SSO -> (UID, SAML token), EAP login -> (username, password), else PSK only.
 pub fn client_auth(cfg: &Config, p: &Profile, sso_token: Option<Secret>) -> Result<ClientAuth, String> {
-    let missing = || "enter a username and password (or enable SSO)".to_string();
+    let missing = || missing("a username and password", "with SSO off, this connection signs in with them", "enter them under Sign-in, or turn on SSO");
     match (p.sso.enabled, p.auth.mode) {
-        (true, _) => Ok(ClientAuth::Eap { identity: EapIdentity::Uid(cfg.uid), secret: sso_token.ok_or("the SSO login returned no token")? }),
+        (true, _) => Ok(ClientAuth::Eap { identity: EapIdentity::Uid(cfg.uid), secret: sso_token.ok_or_else(no_token)? }),
         (false, UserAuth::Eap) => {
             let identity = EapIdentity::User(p.auth.username.clone().ok_or_else(missing)?);
             let secret = Secret::new(p.auth.password.clone()).map_err(|_| missing())?;
@@ -108,21 +116,27 @@ pub fn client_auth(cfg: &Config, p: &Profile, sso_token: Option<Secret>) -> Resu
 /// The backend request for profile `p`. The profile's types already guarantee valid values; this refuses what's
 /// missing.
 pub fn build_request(cfg: &Config, p: &Profile, auth: ClientAuth) -> Result<BackendRequest, String> {
-    let nonempty = |v: &[crate::net::Proposal], phase: &str| Vec1::try_from_vec(v.to_vec()).map_err(|_| format!("{phase}: select at least one proposal"));
+    let proposals = |v: &[crate::net::Proposal], phase: &str| {
+        Vec1::try_from_vec(v.to_vec()).map_err(|_| missing(&format!("a {phase} proposal"), "it says which encryption the gateway may choose", &format!("select one under Advanced → {phase}")))
+    };
     let routes = match p.network.route_mode {
         RouteMode::Gateway => Routes::Gateway,
         RouteMode::Full => Routes::Full,
-        RouteMode::Custom => Routes::Custom(Vec1::try_from_vec(p.network.custom_routes.clone()).map_err(|_| "custom routes: enter at least one network")?),
+        RouteMode::Custom => Routes::Custom(Vec1::try_from_vec(p.network.custom_routes.clone()).map_err(|_| {
+            missing("a network to route", "routing is set to only listed networks, and the list is empty", "enter one under Advanced → Network, or choose another routing option")
+        })?),
     };
     Ok(BackendRequest {
-        gateway: p.gateway.clone().ok_or("no remote gateway configured")?,
+        gateway: p.gateway.clone().ok_or_else(|| missing("a remote gateway", "it's the FortiGate's address", "enter it under Connection → Remote gateway"))?,
         ike_port: p.ike.port,
-        psk: Secret::new(p.psk.clone()).map_err(|_| "no pre-shared key configured")?,
+        psk: Secret::new(p.psk.clone())
+            .map_err(|_| missing("a pre-shared key", "the FortiGate proves who it is with it, also when you sign in with SSO", "enter it under Connection → Pre-shared key"))?,
         auth,
         local_id: p.ike.local_id.clone(),
-        dh_groups: Vec1::try_from_vec(p.ike.dh_groups.clone()).map_err(|_| "Phase 1: select at least one DH group")?,
-        ike_proposals: nonempty(&p.ike.proposals, "Phase 1")?,
-        esp_proposals: nonempty(&p.esp.proposals, "Phase 2")?,
+        dh_groups: Vec1::try_from_vec(p.ike.dh_groups.clone())
+            .map_err(|_| missing("a DH group", "Phase 1 needs one for the key exchange", "select one under Advanced → Phase 1"))?,
+        ike_proposals: proposals(&p.ike.proposals, "Phase 1")?,
+        esp_proposals: proposals(&p.esp.proposals, "Phase 2")?,
         natt_keepalive: p.ike.natt_keepalive,
         ifname: p.network.ifname.clone(),
         mtu: p.network.mtu,
@@ -145,7 +159,7 @@ fn preflight(cfg: &Config, p: &Profile) -> Result<(), String> {
 
 fn run(cfg: &Config, p: &Profile, shared: &Arc<Mutex<Shared>>, cancel: &Arc<AtomicBool>, send: Arc<dyn Fn(Event) + Send + Sync>) -> Result<(), String> {
     if charon::charon_binary().is_none() {
-        return Err(charon::install_hint().into());
+        return Err(charon::install_hint());
     }
     preflight(cfg, p)?;
 
@@ -154,7 +168,7 @@ fn run(cfg: &Config, p: &Profile, shared: &Arc<Mutex<Shared>>, cancel: &Arc<Atom
     if cancel.load(Ordering::SeqCst) {
         return Ok(());
     }
-    let sso_token = sso_token.map(|t| Secret::new(t).map_err(|_| "the SSO login returned no token".to_string())).transpose()?;
+    let sso_token = sso_token.map(|t| Secret::new(t).map_err(|_| no_token())).transpose()?;
     let req = build_request(cfg, p, client_auth(cfg, p, sso_token)?)?;
 
     // ---- 2. IKE + tunnel as root: pkexec <self> --backend ----
@@ -169,7 +183,7 @@ fn sso_login(cfg: &Config, p: &Profile, cancel: &Arc<AtomicBool>, send: Arc<dyn 
     let s3 = send.clone();
     let res = crate::saml::login(
         &crate::saml::SamlParams {
-            gateway: p.gateway.clone().ok_or("no remote gateway configured")?,
+            gateway: p.gateway.clone().ok_or_else(|| missing("a remote gateway", "it's the FortiGate's address", "enter it under Connection → Remote gateway"))?,
             port: p.sso.port,
             uid: cfg.uid,
             verify_cert: p.sso.verify_cert,
@@ -208,11 +222,10 @@ fn run_backend(req: &BackendRequest, shared: &Arc<Mutex<Shared>>, cancel: &Arc<A
     stdin.write_all(line.as_bytes()).map_err(|e| format!("backend stdin: {e}"))?;
     stdin.flush().ok();
     shared.lock().unwrap().backend_stdin = Some(stdin);
-    if cancel.load(Ordering::SeqCst) {
-        if let Some(s) = shared.lock().unwrap().backend_stdin.as_mut() {
+    if cancel.load(Ordering::SeqCst)
+        && let Some(s) = shared.lock().unwrap().backend_stdin.as_mut() {
             let _ = s.write_all(b"disconnect\n");
         }
-    }
     let stderr = child.stderr.take().unwrap();
     let s4 = send.clone();
     let eth = std::thread::spawn(move || {
@@ -277,7 +290,7 @@ extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
 }
 
-/// Entry point for `fortisaml-gui --backend` (run via pkexec).
+/// Entry point for `archway-vpn --backend` (run via pkexec).
 pub fn privileged_main() -> i32 {
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
@@ -323,7 +336,7 @@ pub fn privileged_main() -> i32 {
 }
 
 fn run_privileged(r: &BackendRequest) -> Result<(), String> {
-    let binary = charon::charon_binary().ok_or_else(|| charon::install_hint().to_string())?;
+    let binary = charon::charon_binary().ok_or_else(charon::install_hint)?;
     // held until this process exits, also across the privilege drop
     let _lock = charon::lock()?;
     if charon::kill_stale() > 0 {
@@ -447,9 +460,9 @@ mod tests {
     fn username_login_and_psk_only() {
         let (cfg, mut p) = profile();
         p.sso.enabled = false;
-        assert_eq!(client_auth(&cfg, &p, None).unwrap_err(), "enter a username and password (or enable SSO)");
+        assert!(client_auth(&cfg, &p, None).unwrap_err().starts_with("error: can't connect without a username and password\n"));
         p.auth.username = Some("jane".parse().unwrap());
-        assert_eq!(client_auth(&cfg, &p, None).unwrap_err(), "enter a username and password (or enable SSO)", "no password");
+        assert!(client_auth(&cfg, &p, None).unwrap_err().starts_with("error: can't connect without a username and password\n"), "no password");
         p.auth.password = "pw".into();
         assert_eq!(
             client_auth(&cfg, &p, None).unwrap(),
@@ -467,16 +480,18 @@ mod tests {
             f(&mut q);
             build_request(&cfg, &q, ClientAuth::PskOnly).unwrap_err()
         };
-        assert_eq!(bad(&|q| q.gateway = None), "no remote gateway configured");
-        assert_eq!(bad(&|q| q.psk.clear()), "no pre-shared key configured");
-        assert!(bad(&|q| q.ike.proposals.clear()).starts_with("Phase 1: select at least one proposal"));
-        assert!(bad(&|q| q.ike.dh_groups.clear()).contains("DH group"));
-        assert!(bad(&|q| q.esp.proposals.clear()).starts_with("Phase 2"));
+        // like the app's other errors: a headline, then what's wrong and what to do (see `diag`)
+        let refused = |e: String, headline: &str| assert!(e.starts_with(&format!("error: {headline}\n  note: ")) && e.contains("\n  help: "), "{e}");
+        refused(bad(&|q| q.gateway = None), "can't connect without a remote gateway");
+        refused(bad(&|q| q.psk.clear()), "can't connect without a pre-shared key");
+        refused(bad(&|q| q.ike.proposals.clear()), "can't connect without a Phase 1 proposal");
+        refused(bad(&|q| q.ike.dh_groups.clear()), "can't connect without a DH group");
+        refused(bad(&|q| q.esp.proposals.clear()), "can't connect without a Phase 2 proposal");
         let e = bad(&|q| {
             q.network.route_mode = RouteMode::Custom;
             q.network.custom_routes.clear();
         });
-        assert!(e.starts_with("custom routes"), "{e}");
+        refused(e, "can't connect without a network to route");
     }
 
     #[test]
@@ -484,10 +499,10 @@ mod tests {
         let (cfg, mut p) = profile();
         assert_eq!(preflight(&cfg, &p), Ok(()));
         p.psk.clear();
-        assert_eq!(preflight(&cfg, &p).unwrap_err(), "no pre-shared key configured");
+        assert!(preflight(&cfg, &p).unwrap_err().starts_with("error: can't connect without a pre-shared key\n"));
         let (cfg, mut p) = profile();
         p.sso.enabled = false;
-        assert_eq!(preflight(&cfg, &p).unwrap_err(), "enter a username and password (or enable SSO)");
+        assert!(preflight(&cfg, &p).unwrap_err().starts_with("error: can't connect without a username and password\n"));
     }
 
     #[test]

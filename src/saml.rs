@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const DONE_PAGE: &str = "<html><head><title>FortiSAML</title></head><body style=\"font-family:sans-serif\">\
-<h3>✔ Signed in</h3><p>You can close this tab. FortiSAML VPN continues setting up the connection.</p></body></html>";
+const DONE_PAGE: &str = "<html><head><title>Archway</title></head><body style=\"font-family:sans-serif\">\
+<h3>✔ Signed in</h3><p>You can close this tab. Archway continues setting up the connection.</p></body></html>";
 
 pub struct SamlResult {
     pub username: String,
@@ -170,8 +170,8 @@ pub fn login(
     log(format!("SAML: identity provider login URL: {url}"));
     on_url(&url);
     if p.open_browser {
-        // FORTISAML_BROWSER overrides the opener (e.g. a specific browser, or a test harness)
-        let opener = std::env::var("FORTISAML_BROWSER").unwrap_or_else(|_| "xdg-open".into());
+        // ARCHWAY_BROWSER overrides the opener (e.g. a specific browser, or a test harness)
+        let opener = std::env::var("ARCHWAY_BROWSER").unwrap_or_else(|_| "xdg-open".into());
         match std::process::Command::new(&opener).arg(&url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn() {
             Ok(_) => {}
             Err(e) => log(format!("could not run {opener} ({e}); open the URL manually")),

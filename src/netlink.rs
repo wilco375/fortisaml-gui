@@ -201,7 +201,7 @@ pub fn purge(name: &IfName) -> Result<usize, String> {
         // never delete someone else's interface (a profile could name docker0 or wg0)
         if !is_ours(&l) {
             return Err(format!(
-                "interface {name} exists and isn't a FortiSAML VPN interface (xfrm, if_id {IF_ID:#x}); choose another interface name"
+                "interface {name} exists and isn't an Archway interface (xfrm, if_id {IF_ID:#x}); choose another interface name"
             ));
         }
         del_link(IfIndex::from_kernel(l.header.index)?)?;
@@ -234,7 +234,7 @@ mod tests {
     use super::*;
 
     fn ifn() -> IfName {
-        "fsamltest0".parse().unwrap()
+        "archwaytest0".parse().unwrap()
     }
 
     #[test]
@@ -262,7 +262,7 @@ mod tests {
         let n = ifn();
         add_dummy_for_tests(&n, Ipv4Addr::new(192, 0, 2, 10), 24).unwrap();
         let e = purge(&n).unwrap_err();
-        assert!(e.contains("isn't a FortiSAML VPN interface"), "{e}");
+        assert!(e.contains("isn't an Archway interface"), "{e}");
         assert!(link_index(&n).unwrap().is_some(), "left alone");
         assert!(add_xfrm_link(&n).is_err(), "and not taken over either");
     }
@@ -271,14 +271,14 @@ mod tests {
     #[ignore]
     fn route_to_finds_the_path_and_host_route_goes_via_it() {
         // a dummy uplink with a default route, like a real machine
-        let up: IfName = "fsamlup0".parse().unwrap();
+        let up: IfName = "archwayup0".parse().unwrap();
         add_dummy_for_tests(&up, Ipv4Addr::new(192, 0, 2, 10), 24).unwrap();
         let ui = link_index(&up).unwrap().unwrap();
         add_route_via("0.0.0.0/0".parse().unwrap(), Some(Ipv4Addr::new(192, 0, 2, 1)), ui).unwrap();
         let (gw, oif) = route_to(Ipv4Addr::new(198, 51, 100, 7)).unwrap();
         assert_eq!((gw, oif), (Some(Ipv4Addr::new(192, 0, 2, 1)), ui));
         add_route_via("198.51.100.7/32".parse().unwrap(), gw, oif).unwrap();
-        assert_eq!(purge(&"fsamlnone0".parse().unwrap()).unwrap(), 2, "our default + host route");
+        assert_eq!(purge(&"archwaynone0".parse().unwrap()).unwrap(), 2, "our default + host route");
         del_link(ui).unwrap();
     }
 }

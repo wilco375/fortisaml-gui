@@ -2,6 +2,7 @@
 //! - config.toml: app settings; profiles/<name>.toml: one per connection, shareable by copying the file.
 //!   Both only hold values that differ from the default.
 //! - state.json in the XDG state dir: profile ids (the keyring key), selection, log panel. App-only.
+//!
 //! The PSK and password are not in these files: they live in the Secret Service (see keyring.rs).
 //!
 //! Every setting has a checked type (net.rs): a file with a bad value is reported and not loaded.
@@ -15,6 +16,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+/// A new profile's xfrm interface.
+pub const DEFAULT_IFNAME: &str = "archway0";
 
 /// Groups shown by the official client but not implemented here (rendered disabled).
 pub const DH_UNSUPPORTED: [u16; 8] = [1, 2, 5, 15, 16, 17, 18, 31];
@@ -211,7 +215,7 @@ impl Default for Network {
             custom_routes: Vec::new(),
             block_ipv6: true,
             set_dns: true,
-            ifname: "fsaml0".parse().expect("valid interface name"),
+            ifname: DEFAULT_IFNAME.parse().expect("valid interface name"),
             mtu: Mtu::try_from(1400).expect("in range"),
         }
     }
@@ -267,7 +271,7 @@ impl Default for Config {
             selected: 0,
             uid: ClientUid::generate().expect(RNG_FAILED),
             verbose: false,
-            show_log: true,
+            show_log: false,
             unreadable: BTreeMap::new(),
             orphans: Vec::new(),
             outdated: HashSet::new(),
@@ -285,7 +289,7 @@ struct AppFile {
 }
 
 /// state.json
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct StateFile {
     /// profile name -> id
@@ -294,12 +298,6 @@ struct StateFile {
     /// name of the selected profile
     selected: String,
     show_log: bool,
-}
-
-impl Default for StateFile {
-    fn default() -> Self {
-        Self { ids: BTreeMap::new(), orphans: Vec::new(), selected: String::new(), show_log: true }
-    }
 }
 
 /// A fresh random id (profile keyring keys). Panics only if the OS random number generator fails, instead of
@@ -324,8 +322,8 @@ impl Paths {
     pub fn from_env() -> Self {
         let xdg = |var: &str, fallback: &str| xdg_dir(std::env::var_os(var), std::env::var_os("HOME"), fallback);
         Self {
-            config_dir: xdg("XDG_CONFIG_HOME", ".config").join("fortisaml-gui"),
-            state_dir: xdg("XDG_STATE_HOME", ".local/state").join("fortisaml-gui"),
+            config_dir: xdg("XDG_CONFIG_HOME", ".config").join("archway-vpn"),
+            state_dir: xdg("XDG_STATE_HOME", ".local/state").join("archway-vpn"),
         }
     }
     pub fn config_file(&self) -> PathBuf {
@@ -425,15 +423,15 @@ impl Config {
 
     /// Per profile: why its name can't be saved, if it can't (the per-name rules are in `ProfileName`).
     pub fn name_problems(&self) -> Vec<Option<&'static str>> {
-        let mut seen = HashSet::new();
-        self.profiles
-            .iter()
-            .map(|p| {
-                (!seen.insert(&p.name))
-                    .then_some("Another connection already has this name.")
-                    .or_else(|| self.unreadable.contains_key(p.name.as_str()).then_some("A connection file with this name couldn't be read."))
-            })
-            .collect()
+        (0..self.profiles.len()).map(|i| self.name_problem(i)).collect()
+    }
+
+    /// Why profile `i`'s name can't be saved: an earlier profile has it, or an unreadable file does.
+    pub fn name_problem(&self, i: usize) -> Option<&'static str> {
+        let name = &self.profiles[i].name;
+        (self.profiles[..i].iter().any(|p| &p.name == name))
+            .then_some("Another connection already has this name.")
+            .or_else(|| self.unreadable.contains_key(name.as_str()).then_some("A connection file with this name couldn't be read."))
     }
 
     /// `base`, or `base 2`, `base 3`, ...: the first name no profile (or unreadable file) uses.
@@ -616,7 +614,7 @@ mod tests {
     impl Tmp {
         fn new() -> Self {
             static N: AtomicUsize = AtomicUsize::new(0);
-            let dir = std::env::temp_dir().join(format!("fortisaml-gui-cfg-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+            let dir = std::env::temp_dir().join(format!("archway-vpn-cfg-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
             let _ = std::fs::remove_dir_all(&dir);
             Self { paths: Paths { config_dir: dir.join("config"), state_dir: dir.join("state") }, dir }
         }
@@ -668,8 +666,7 @@ mod tests {
     #[test]
     fn rename_and_remove_delete_old_files_but_a_swap_deletes_nothing() {
         let t = Tmp::new();
-        let mut saved = Config::default();
-        saved.profiles = vec![profile("A"), profile("B"), profile("C")];
+        let saved = Config { profiles: vec![profile("A"), profile("B"), profile("C")], ..Config::default() };
         saved.save_to(&t.paths, &saved).unwrap();
         let mut c = saved.clone();
         c.profiles[0].name = "B".into();
@@ -704,8 +701,7 @@ mod tests {
     #[test]
     fn vanished_and_renamed_files_leave_orphan_ids() {
         let t = Tmp::new();
-        let mut c = Config::default();
-        c.profiles = vec![profile("A"), profile("B"), profile("C")];
+        let c = Config { profiles: vec![profile("A"), profile("B"), profile("C")], ..Config::default() };
         c.save_to(&t.paths, &c).unwrap();
         std::fs::remove_file(t.paths.profile_file("A")).unwrap();
         std::fs::rename(t.paths.profile_file("B"), t.paths.profile_file("B2")).unwrap();
@@ -726,7 +722,7 @@ mod tests {
         std::fs::create_dir_all(&t.paths.state_dir).unwrap();
         std::fs::write(t.paths.state_file(), format!(r#"{{"ids":{{"Office":"{id}"}},"orphans":["{orphan}"]}}"#)).unwrap();
         let l = Config::load_from(&t.paths);
-        assert_eq!(l.orphans, [orphan.clone()], "only the recorded orphans");
+        assert_eq!(l.orphans, std::slice::from_ref(&orphan), "only the recorded orphans");
         assert!(l.load_errors.is_empty(), "{:?}", l.load_errors);
         std::fs::create_dir_all(&t.paths.config_dir).unwrap();
         std::fs::write(t.paths.profiles_dir(), "").unwrap(); // a file: listing fails with something other than NotFound
@@ -889,8 +885,7 @@ mod tests {
     #[test]
     fn save_then_load_keeps_settings_ids_and_selection() {
         let t = Tmp::new();
-        let mut c = Config::default();
-        c.profiles = vec![profile("B"), profile("A")];
+        let mut c = Config { profiles: vec![profile("B"), profile("A")], ..Config::default() };
         c.profiles[0].gateway = Some("b.example".parse().unwrap());
         c.selected = 0; // "B"
         c.show_log = false;
@@ -950,9 +945,7 @@ mod tests {
 
     #[test]
     fn duplicate_gets_new_id() {
-        let mut p = Profile::default();
-        p.name = "Office".into();
-        p.psk = "k".into();
+        let p = Profile { name: "Office".into(), psk: "k".into(), ..Profile::default() };
         let d = p.duplicate();
         assert_ne!(d.id, p.id);
         assert_eq!(d.name.as_str(), "Office (copy)");
@@ -983,8 +976,7 @@ mod tests {
 
     #[test]
     fn name_errors_report_clashing_and_unreadable_names() {
-        let mut c = Config::default();
-        c.profiles = ["Office", "Office", "Broken", "fine"].map(profile).to_vec();
+        let mut c = Config { profiles: ["Office", "Office", "Broken", "fine"].map(profile).to_vec(), ..Config::default() };
         c.unreadable.insert("Broken".into(), new_uid());
         let errors = c.name_errors();
         assert_eq!(errors.len(), 2, "{errors:#?}");
@@ -1074,7 +1066,7 @@ mod tests {
         // the log-file option is gone; a config.toml that still has it loads, and the next Save drops the key
         let t = Tmp::new();
         std::fs::create_dir_all(&t.paths.config_dir).unwrap();
-        std::fs::write(t.paths.config_file(), "uid = \"0123456789ABCDEF0123456789ABCDEF\"\nlog_file = \"~/fortisaml.log\"\n").unwrap();
+        std::fs::write(t.paths.config_file(), "uid = \"0123456789ABCDEF0123456789ABCDEF\"\nlog_file = \"~/archway.log\"\n").unwrap();
         let l = Config::load_from(&t.paths);
         assert!(l.load_errors.is_empty(), "{:?}", l.load_errors);
         l.save_to(&t.paths, &l).unwrap();

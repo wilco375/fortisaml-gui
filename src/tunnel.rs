@@ -106,7 +106,7 @@ mod tests {
     }
 
     fn opts(routes: Option<Vec<Ipv4Net>>) -> TunnelOpts {
-        TunnelOpts { ifname: "fsamltest0".parse().unwrap(), mtu: Mtu::try_from(1400).unwrap(), routes, block_ipv6: true, set_dns: false }
+        TunnelOpts { ifname: "archwaytest0".parse().unwrap(), mtu: Mtu::try_from(1400).unwrap(), routes, block_ipv6: true, set_dns: false }
     }
 
     fn quiet(_: String) {}
@@ -118,17 +118,17 @@ mod tests {
         t.configure(&est(&["10.10.0.0/16", "10.20.0.0/16"]), &opts(None), &quiet).unwrap();
         assert!(!t.full);
         assert_eq!(t.routes.len(), 2);
-        assert!(netlink::link_index(&"fsamltest0".parse().unwrap()).unwrap().is_some());
+        assert!(netlink::link_index(&"archwaytest0".parse().unwrap()).unwrap().is_some());
         t.down(&quiet);
-        assert!(netlink::link_index(&"fsamltest0".parse().unwrap()).unwrap().is_none());
-        assert_eq!(netlink::purge(&"fsamltest0".parse().unwrap()).unwrap(), 0, "nothing left behind");
+        assert!(netlink::link_index(&"archwaytest0".parse().unwrap()).unwrap().is_none());
+        assert_eq!(netlink::purge(&"archwaytest0".parse().unwrap()).unwrap(), 0, "nothing left behind");
     }
 
     #[test]
     #[ignore]
     fn full_tunnel_keeps_gateway_route_and_blocks_ipv6() {
         // uplink with a default route, as on a real machine
-        let up: IfName = "fsamlup0".parse().unwrap();
+        let up: IfName = "archwayup0".parse().unwrap();
         netlink::add_dummy_for_tests(&up, Ipv4Addr::new(192, 0, 2, 10), 24).unwrap();
         let ui = netlink::link_index(&up).unwrap().unwrap();
         netlink::add_route_via("0.0.0.0/0".parse().unwrap(), Some(Ipv4Addr::new(192, 0, 2, 1)), ui).unwrap();
@@ -147,7 +147,7 @@ mod tests {
     #[ignore]
     fn existing_route_to_the_gateway_is_used_and_left_alone() {
         // e.g. left behind by another VPN client: full tunnel must still work, and not delete it afterwards
-        let up: IfName = "fsamlup0".parse().unwrap();
+        let up: IfName = "archwayup0".parse().unwrap();
         netlink::add_dummy_for_tests(&up, Ipv4Addr::new(192, 0, 2, 10), 24).unwrap();
         let ui = netlink::link_index(&up).unwrap().unwrap();
         netlink::add_route_via("0.0.0.0/0".parse().unwrap(), Some(Ipv4Addr::new(192, 0, 2, 1)), ui).unwrap();
@@ -167,6 +167,6 @@ mod tests {
         let e = t.configure(&est(&["0.0.0.0/0"]), &opts(None), &quiet).unwrap_err();
         assert!(e.contains("198.51.100.7") || e.contains("unreachable"), "{e}");
         t.down(&quiet);
-        assert!(netlink::link_index(&"fsamltest0".parse().unwrap()).unwrap().is_none(), "interface removed again");
+        assert!(netlink::link_index(&"archwaytest0".parse().unwrap()).unwrap().is_none(), "interface removed again");
     }
 }
