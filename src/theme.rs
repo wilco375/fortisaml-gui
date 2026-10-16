@@ -306,6 +306,30 @@ pub fn icon_button(ui: &mut Ui, icon: &str, label: &str, on: bool) -> egui::Resp
     ghost(ui, true, text, vec2(36.0, 36.0), Vec2::ZERO, 8, on, label).on_hover_text(label)
 }
 
+/// egui's spinner, but repainting at 20 fps instead of every frame: it can spin for minutes while the user signs in,
+/// and a full window repaint at the display's refresh rate costs ~10% of a core for nothing.
+pub fn spinner(ui: &mut Ui, size: f32, color: Color32) -> egui::Response {
+    let (rect, r) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    r.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::ProgressIndicator));
+    if ui.is_rect_visible(rect) {
+        ui.request_repaint_after(std::time::Duration::from_millis(50));
+        // the same arc as egui::Spinner
+        let radius = size / 2.0 - 2.0;
+        let n = (radius.round() as u32).clamp(8, 128);
+        let time = ui.input(|i| i.time);
+        let start = time * std::f64::consts::TAU;
+        let end = start + 240f64.to_radians() * time.sin();
+        let points = (0..n)
+            .map(|i| {
+                let (sin, cos) = egui::lerp(start..=end, f64::from(i) / f64::from(n)).sin_cos();
+                rect.center() + radius * vec2(cos as f32, sin as f32)
+            })
+            .collect();
+        ui.painter().add(egui::Shape::line(points, Stroke::new(3.0, color)));
+    }
+    r
+}
+
 /// Side of `small_icon_button`.
 pub const SMALL_BUTTON: f32 = 28.0;
 

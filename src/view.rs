@@ -302,13 +302,13 @@ impl App {
                     }
                     State::Disconnecting => {
                         theme::action(ui, false, Tone::Danger, icon::PLUGS, "Disconnect");
-                        ui.add(egui::Spinner::new().size(22.0).color(t.warning));
+                        theme::spinner(ui, 22.0, t.warning);
                     }
                     _ => {
                         if theme::action(ui, true, Tone::Plain, icon::X, "Cancel").clicked() {
                             self.disconnect();
                         }
-                        ui.add(egui::Spinner::new().size(22.0).color(t.warning));
+                        theme::spinner(ui, 22.0, t.warning);
                     }
                 });
             });
