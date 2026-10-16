@@ -36,6 +36,10 @@ zeroize = "1.9"
 
 [profile.release]
 strip = true
+# a binary a third smaller (22.6 -> 14.5 MB) for a slower release build; the UI is no slower to draw at "s"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
 
 # Release packages: `cargo deb` and `cargo generate-rpm` (see .github/workflows/release.yml). Dependencies are listed by
 # hand: the GUI libs are dlopen()ed, so automatic detection would miss them.
